@@ -1,0 +1,138 @@
+---
+title: "POST /api/v1/pedidos/domicilio/ — Invoice a Delivery Order"
+sidebarTitle: "POST /domicilio"
+description: "Submit a delivery order invoice to DIAN, including a separately taxed delivery fee. Supports orders from Rappi, Didi, and proprietary platforms. Currently planned."
+---
+
+Delivery orders (*pedidos a domicilio*) require a dedicated invoicing flow because the delivery fee is taxed differently from the prepared food items on the same order. While restaurant food typically carries INC at 8 %, the delivery fee is generally subject to IVA at 19 % — and must appear as a distinct, separately taxed line on the electronic invoice. This endpoint handles orders from any delivery channel: Rappi, Didi, your own web platform, or an in-house dispatcher. The acquirer model mirrors the local order endpoint and supports both anonymous consumers and identified customers.
+
+<Warning>
+  This endpoint is **planned but not yet implemented**. It follows the same Hexagonal Architecture pattern as the local order endpoint (`/api/v1/pedidos/consumo-local/`) and will reuse the `IDianSoapPort` interface defined in `src/application/ports/dian_port.py`. This page documents the planned interface based on `docs/features/pedido_domicilio.md` and the `InvoiceCreateRequest` schema in `src/infrastructure/controllers/schemas/invoice_schema.py`.
+</Warning>
+
+## Planned Endpoint
+
+| Property | Value |
+|---|---|
+| **Method** | `POST` |
+| **Path** | `/api/v1/pedidos/domicilio/` *(planned)* |
+| **Success status** | `201 Created` *(planned)* |
+
+## Business Rules
+
+The following rules are derived from the project feature spec (*Historia de Usuario 2: Facturación de Pedidos a Domicilio*):
+
+<Steps>
+  <Step title="Delivery fee is a separate taxable line item">
+    The `delivery_fee` must be treated as an independent invoice line with its own tax rate. It is **not** bundled into the food items' subtotal. Typically it is subject to **IVA 19 %**, not INC 8 %.
+  </Step>
+
+  <Step title="Tax rates are configurable per item">
+    The `InvoiceItemDTO` schema exposes both `inc_tax_rate` and `iva_tax_rate` as optional per-item fields. The POS or delivery platform integration is responsible for sending the correct rate for each line, including the delivery fee line.
+  </Step>
+
+  <Step title="Acquirer model is identical to local orders">
+    The `customer_id` field follows the same anonymous/identified pattern: `"222222222222"` for Consumidor Final, or the customer's RUT/NIT for identified buyers. Delivery platforms may supply a customer identifier during checkout.
+  </Step>
+
+  <Step title="Voluntary tip is excluded from the taxable base">
+    As with dine-in orders, `voluntary_tip` appears on the invoice for transparency but is not subject to INC or IVA, and does not increase the taxable base.
+  </Step>
+</Steps>
+
+## Planned Request Body
+
+The following fields are based on `InvoiceCreateRequest` from `src/infrastructure/controllers/schemas/invoice_schema.py` and the delivery feature specification.
+
+<ParamField body="items" type="array" required>
+  List of order items. Each item carries independent tax configuration, allowing food lines and the delivery fee line to be taxed at different rates within the same invoice.
+
+  <Expandable title="InvoiceItemDTO fields">
+    <ParamField body="name" type="string" required>
+      Product or service name as it will appear on the invoice line.
+    </ParamField>
+
+    <ParamField body="quantity" type="float" required>
+      Quantity of the product (supports fractional quantities for weight-based items).
+    </ParamField>
+
+    <ParamField body="price" type="float" required>
+      Unit price before taxes.
+    </ParamField>
+
+    <ParamField body="inc_tax_rate" type="float">
+      Impuesto Nacional al Consumo rate for this item (e.g., `0.08` for 8 %). Set to `null` or omit if INC does not apply to this line.
+    </ParamField>
+
+    <ParamField body="iva_tax_rate" type="float">
+      IVA rate for this item (e.g., `0.19` for 19 %). Set to `null` or omit if IVA does not apply to this line. Typically used for the delivery fee line item.
+    </ParamField>
+  </Expandable>
+</ParamField>
+
+<ParamField body="voluntary_tip" type="float" default="0.0">
+  Voluntary tip amount. Reported on the invoice but **not taxable** — excluded from both INC and IVA bases.
+</ParamField>
+
+<ParamField body="customer_id" type="string" default="222222222222">
+  Customer RUT, NIT, or Cédula number. Defaults to the DIAN-approved anonymous consumer code `"222222222222"`. Delivery platforms may supply the end customer's identifier at checkout.
+</ParamField>
+
+<ParamField body="delivery_fee" type="float" default="0.0">
+  Delivery fee amount. This value is added as a distinct invoice line subject to `iva_tax_rate` (typically 19 %). A value of `0.0` indicates no delivery charge (e.g., free delivery promotions).
+</ParamField>
+
+<ParamField body="delivery_channel" type="string">
+  Identifies the platform or channel through which the order was placed. Used for reporting, reconciliation with third-party platform invoices, and operational analytics. Accepted values: `"RAPPI"`, `"DIDI"`, `"WEB"`, `"LOCAL"`.
+</ParamField>
+
+## Tax Differences vs. Local Orders
+
+The key distinction between a delivery order and a dine-in order is the tax treatment of the delivery fee line:
+
+<Tabs>
+  <Tab title="Local dine-in order">
+    | Line item | Applicable tax | Typical rate |
+    |---|---|---|
+    | Food & beverages | INC | 8 % |
+    | Alcoholic beverages (certain categories) | IVA | 19 % |
+    | Voluntary tip | None | — |
+
+    All item-level tax configuration is handled through `ImpuestoRequest.nombre` and `ImpuestoRequest.tasa` in `PedidoLocalCreateRequest`.
+  </Tab>
+
+  <Tab title="Delivery order">
+    | Line item | Applicable tax | Typical rate |
+    |---|---|---|
+    | Food & beverages | INC | 8 % |
+    | Delivery fee | IVA | 19 % |
+    | Voluntary tip | None | — |
+
+    The `InvoiceItemDTO` fields `inc_tax_rate` and `iva_tax_rate` allow **per-item tax configuration** directly on each line, so the delivery fee can carry IVA while the food items carry INC — all within a single invoice payload.
+  </Tab>
+</Tabs>
+
+Example `items` array showing mixed tax treatment:
+
+```json
+[
+  {
+    "name": "Hamburguesa Clásica",
+    "quantity": 1,
+    "price": 18000.00,
+    "inc_tax_rate": 0.08,
+    "iva_tax_rate": null
+  },
+  {
+    "name": "Servicio de Domicilio",
+    "quantity": 1,
+    "price": 5000.00,
+    "inc_tax_rate": null,
+    "iva_tax_rate": 0.19
+  }
+]
+```
+
+<Tip>
+  The `delivery_channel` value (e.g., `"RAPPI"`, `"DIDI"`) is persisted in the audit log alongside the invoice payload. This makes it straightforward to reconcile your DIAN-issued invoices against the platform's own settlement reports at month-end — filter audit log entries by `delivery_channel` to isolate each platform's revenue and tax contribution.
+</Tip>

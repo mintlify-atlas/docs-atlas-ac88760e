@@ -1,0 +1,241 @@
+---
+title: "Authentication and DIAN Credentials in DIAN REST API"
+sidebarTitle: "Authentication"
+description: "How DIAN REST API authenticates with Colombia's DIAN SOAP service using a PFX certificate, TestSetId, SoftwareId, and SoftwarePin — with no client-facing auth layer."
+---
+
+DIAN REST API operates with a **two-layer authentication model**: there is currently no authentication enforced on the HTTP REST endpoints themselves, but every outbound DIAN SOAP call is authenticated using a PFX digital certificate and a set of DIAN-issued credentials. All credentials are loaded from environment variables at startup via Pydantic Settings, and the PFX certificate is validated before the application accepts any traffic. Understanding this split is essential for both integrating with the API and deploying it safely.
+
+---
+
+## No Client Auth (Current State)
+
+The current implementation does **not** enforce any authentication mechanism (API keys, JWTs, OAuth2, mTLS) on the REST endpoints. Any `POST` request reaching the service is accepted and processed without a credential check.
+
+<Warning>
+  Exposing this API without authentication on a public network would allow anyone to trigger DIAN invoice submissions using **your company's registered certificate and credentials**. Fraudulent invoices submitted under your NIT are legally binding in Colombia. Never bind this service to a public interface without a protecting gateway.
+</Warning>
+
+This design is intentional for a service that is expected to run **inside a private network or behind an API gateway** that handles client-level auth upstream. The API itself stays thin and focused on the DIAN integration logic.
+
+**Recommended gateway-level auth patterns for production:**
+
+| Pattern | Tools |
+|---------|-------|
+| API Key (header) | Kong Gateway, AWS API Gateway, Traefik |
+| OAuth2 / JWT Bearer | Keycloak, Auth0, AWS Cognito |
+| Mutual TLS (mTLS) | Envoy, Nginx, HAProxy |
+
+---
+
+## DIAN SOAP Authentication
+
+All actual authentication happens at the **DIAN SOAP layer**. When the API forwards an invoice, it identifies itself to DIAN using four credentials that must be configured via environment variables before startup.
+
+<CardGroup cols={2}>
+  <Card title="PFX Certificate" icon="certificate">
+    **`DIAN_CERT_PATH`** + **`DIAN_CERT_PASSWORD`**
+
+    The PKCS#12 (`.pfx`) digital signing certificate issued during DIAN software registration. Used to sign the XML invoice document before submission. The private key is extracted from the PFX and passed to the SOAP signing plugin.
+
+    ```bash
+    DIAN_CERT_PATH=/ruta/absoluta/al/certificado.pfx
+    DIAN_CERT_PASSWORD=password_segura
+    ```
+  </Card>
+
+  <Card title="Software ID" icon="fingerprint">
+    **`DIAN_SOFTWARE_ID`**
+
+    UUID that uniquely identifies the billing software registered on the DIAN portal. Included in the XML invoice header to associate the document with your software registration.
+
+    ```bash
+    DIAN_SOFTWARE_ID=xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
+    ```
+  </Card>
+
+  <Card title="Test Set ID" icon="flask">
+    **`DIAN_TEST_SET_ID`**
+
+    UUID provided by DIAN for the *habilitación* (certification) process. Passed as the `testSetId` parameter in `SendTestSetAsync` SOAP calls. Required during testing; not used in the production WSDL.
+
+    ```bash
+    DIAN_TEST_SET_ID=xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
+    ```
+  </Card>
+
+  <Card title="Software PIN" icon="key">
+    **`DIAN_SOFTWARE_PIN`**
+
+    The PIN associated with your registered billing software on the DIAN portal. Used as part of the software security hash included in the XML invoice.
+
+    ```bash
+    DIAN_SOFTWARE_PIN=12345
+    ```
+  </Card>
+</CardGroup>
+
+The two WSDL endpoints (habilitación and producción) are also configured via environment variables. The controller's `get_dian_adapter()` dependency selects the correct one based on `ENVIRONMENT`:
+
+```bash
+# Testing / habilitación environment
+DIAN_WSDL_URL_HABILITACION=https://vpfe-hab.dian.gov.co/WcfDianCustomerServices.mac/WcfDianCustomerServices.svc?wsdl
+
+# Production environment
+DIAN_WSDL_URL_PRODUCCION=https://vpfe.dian.gov.co/WcfDianCustomerServices.mac/WcfDianCustomerServices.svc?wsdl
+
+# Controls which WSDL is used: "local", "staging" → habilitación; "production" → producción
+ENVIRONMENT=local
+```
+
+---
+
+## Credential Flow
+
+The following sequence describes exactly how credentials move from the `.env` file to the outbound DIAN SOAP request:
+
+**1. Load and validate at startup**
+
+`Settings` (a Pydantic `BaseSettings` subclass in `src/infrastructure/config/settings.py`) reads all environment variables when the module is first imported. The `model_validator` then immediately attempts to open and decode the PFX file:
+
+```python
+@model_validator(mode="after")
+def validate_pfx_certificate(self) -> "Settings":
+    pfx_path = self.DIAN_CERT_PATH
+    password = self.DIAN_CERT_PASSWORD.get_secret_value()
+
+    with open(pfx_path, "rb") as cert_file:
+        pfx_data = cert_file.read()
+
+    pkcs12.load_key_and_certificates(
+        pfx_data,
+        password.encode("utf-8") if password else None,
+    )
+    return self
+```
+
+If the path is wrong, the file is not a valid PFX, or the password is incorrect, the application **raises an exception and refuses to start** (fast-fail). This prevents a misconfigured deployment from silently producing unsigned invoices.
+
+**2. Adapter instantiation via FastAPI dependency injection**
+
+On every request to `POST /api/v1/pedidos/consumo-local/`, FastAPI calls `get_dian_adapter()` to build a fresh `DianSoapAdapter`:
+
+```python
+def get_dian_adapter() -> DianSoapAdapter:
+    wsdl = (
+        settings.DIAN_WSDL_URL_HABILITACION
+        if settings.ENVIRONMENT != "production"
+        else settings.DIAN_WSDL_URL_PRODUCCION
+    )
+    return DianSoapAdapter(
+        wsdl_url=wsdl,
+        cert_path=str(settings.DIAN_CERT_PATH),
+        password=settings.DIAN_CERT_PASSWORD.get_secret_value()
+    )
+```
+
+`DIAN_CERT_PASSWORD` is stored as a Pydantic `SecretStr`, so it never appears in logs or `repr()` output. `.get_secret_value()` is only called here, at the point of use.
+
+**3. SOAP client construction**
+
+`DianSoapAdapter.__init__()` creates an async `zeep.AsyncClient` backed by an `httpx.AsyncClient` transport. In the current boilerplate the XML signing step is abstracted:
+
+```python
+self.client = AsyncClient(
+    wsdl=self.wsdl_url,
+    transport=self.transport,
+    plugins=[self.history]
+)
+```
+
+**4. Full production signing (implementation note)**
+
+In a production-ready implementation, the private key extracted from the PFX would be passed to `zeep.wsse.Signature` (or an equivalent `signxml`-based plugin) to sign the SOAP envelope before dispatch:
+
+```python
+# Production pattern — not yet active in the boilerplate
+from zeep.wsse.signature import Signature
+
+self.client = AsyncClient(
+    wsdl=self.wsdl_url,
+    transport=self.transport,
+    wsse=Signature(
+        key_file=cert_path,
+        certfile=cert_path,
+        password=password
+    ),
+    plugins=[self.history]
+)
+```
+
+---
+
+## Obtaining DIAN Credentials
+
+<CardGroup cols={2}>
+  <Card title="Software Registration" icon="building-columns">
+    Register your billing software on the [DIAN portal](https://www.dian.gov.co) (Servicios en Línea → Facturación Electrónica → Software de Facturación) to obtain:
+
+    - `SoftwareID` — generated automatically on registration
+    - `SoftwarePIN` — assigned during registration
+    - `TestSetId` — provided when DIAN opens a habilitación set for your software
+  </Card>
+
+  <Card title="PFX Certificate" icon="shield-halved">
+    The `.pfx` signing certificate is issued by DIAN directly or by an authorized certification authority (CA) recognised by DIAN, including:
+
+    - **Certicámara** — [certicamara.com](https://www.certicamara.com)
+    - **GS1 Colombia** — [gs1co.org](https://www.gs1co.org)
+
+    The certificate must be bound to your company's NIT (tax identification number).
+  </Card>
+</CardGroup>
+
+---
+
+## Production Considerations
+
+Moving from a local development setup to a production deployment requires additional security controls around the API itself and the credentials it holds.
+
+<CardGroup cols={2}>
+  <Card title="API Gateway Auth" icon="shield">
+    Place the API behind an API gateway to enforce client authentication before requests ever reach the FastAPI process:
+
+    - **Kong Gateway** — API key or OAuth2 plugin
+    - **AWS API Gateway** — IAM auth, Cognito authoriser, or Lambda authoriser
+    - **Traefik** — ForwardAuth middleware
+  </Card>
+
+  <Card title="Secrets Management" icon="vault">
+    Never store `DIAN_CERT_PASSWORD`, `DIAN_SOFTWARE_PIN`, or UUIDs in plain `.env` files on production servers. Use a dedicated secrets manager:
+
+    - **AWS Secrets Manager** — inject into ECS task definitions or Lambda at runtime
+    - **HashiCorp Vault** — pull secrets via the Vault Agent sidecar
+    - **GCP Secret Manager** — mount as environment variables via Cloud Run
+  </Card>
+
+  <Card title="PFX File Permissions" icon="lock">
+    Restrict filesystem access to the `.pfx` certificate so only the application user can read it:
+
+    ```bash
+    chmod 600 /ruta/absoluta/al/certificado.pfx
+    chown app_user:app_group /ruta/absoluta/al/certificado.pfx
+    ```
+
+    Consider storing the certificate in a dedicated, non-web-accessible directory outside the project root.
+  </Card>
+
+  <Card title="Network Isolation" icon="network-wired">
+    Bind the FastAPI process to `127.0.0.1` (or an internal VPC address) and expose it only through the gateway:
+
+    ```bash
+    uvicorn src.main:app --host 127.0.0.1 --port 8000
+    ```
+
+    Outbound connections to DIAN WSDL URLs require HTTPS on port 443 — ensure egress is allowed from your environment.
+  </Card>
+</CardGroup>
+
+<Note>
+  The `ENVIRONMENT` variable controls which DIAN WSDL endpoint the adapter connects to. Set `ENVIRONMENT=production` only when your software has **passed DIAN's habilitación process** and is cleared to submit real fiscal documents. Submitting test invoices to the production endpoint (or vice versa) will result in rejected documents.
+</Note>

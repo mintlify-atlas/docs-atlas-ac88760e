@@ -1,0 +1,231 @@
+---
+title: "POST /api/v1/pedidos/consumo-local/ — Invoice a Dine-In Restaurant Order"
+sidebarTitle: "POST /consumo-local"
+description: "POST /api/v1/pedidos/consumo-local/ accepts a POS order payload and submits an electronic invoice to DIAN. Returns track_id and CUFE on success."
+---
+
+This is the primary billing endpoint for dine-in restaurant orders. It accepts a structured POS order payload, validates that the declared invoice totals are arithmetically consistent, maps the incoming DTO to domain entities, logs the attempt to the audit repository, and submits the electronic invoice to the DIAN SOAP service via the `IDianSoapPort` adapter. On success, the DIAN response is normalised and returned as a `PedidoLocalResponse` containing the `track_id` (ZipKey) and optional `cufe` for downstream traceability.
+
+## Endpoint Details
+
+| Property | Value |
+|---|---|
+| **Method** | `POST` |
+| **Path** | `/api/v1/pedidos/consumo-local/` |
+| **Router prefix** | `/api/v1/pedidos/consumo-local` *(declared in `pedido_local_controller.py`)* |
+| **Tags** | `Facturación Local` |
+| **Success status** | `201 Created` |
+
+## Request Body
+
+The endpoint accepts a JSON body that conforms to `PedidoLocalCreateRequest` (defined in `src/infrastructure/controllers/schemas/pedido_local_schema.py`).
+
+### Top-level fields
+
+<ParamField body="id_pedido_origen" type="string" required>
+  The order identifier assigned by the POS system. Used as the `id_pedido` key on the domain entity and as the primary correlation reference in audit logs.
+</ParamField>
+
+<ParamField body="adquirente" type="object">
+  Customer identification details. If omitted, the invoice is issued to **Consumidor Final** using the DIAN-approved anonymous taxpayer values.
+
+  <Expandable title="adquirente fields">
+    <ParamField body="tipo_documento" type="string" default="13">
+      DIAN document type code. `"13"` corresponds to Cédula de Ciudadanía. Use `"31"` for NIT (legal entities).
+    </ParamField>
+
+    <ParamField body="numero_documento" type="string" default="222222222222">
+      Document number of the customer. The default value `"222222222222"` is the DIAN-sanctioned identifier for anonymous end consumers.
+    </ParamField>
+
+    <ParamField body="razon_social" type="string" default="Consumidor Final">
+      Full name or registered business name of the customer.
+    </ParamField>
+  </Expandable>
+</ParamField>
+
+<ParamField body="items" type="array" required>
+  Ordered list of products or services included in the invoice. Must contain **at least one** item (`min_length=1`).
+
+  <Expandable title="Item fields">
+    <ParamField body="id_producto" type="string" required>
+      Product SKU or identifier from the POS catalogue (e.g., `"PROD-001"`).
+    </ParamField>
+
+    <ParamField body="descripcion" type="string" required>
+      Human-readable product description that will appear on the invoice line (e.g., `"Hamburguesa Sencilla"`).
+    </ParamField>
+
+    <ParamField body="cantidad" type="integer" required>
+      Quantity of the product. Must be greater than `0` (`gt=0`).
+    </ParamField>
+
+    <ParamField body="precio_unitario" type="Decimal" required>
+      Unit price of the product before taxes (e.g., `10000.00`).
+    </ParamField>
+
+    <ParamField body="impuestos" type="array" required>
+      List of taxes applied to this line item. Each entry is an `ImpuestoRequest` object.
+
+      <Expandable title="ImpuestoRequest fields">
+        <ParamField body="nombre" type="string" required>
+          Tax type name. Common values: `"INC"` (Impuesto Nacional al Consumo) or `"IVA"`.
+        </ParamField>
+
+        <ParamField body="tasa" type="Decimal" required>
+          Decimal tax rate (e.g., `0.08` for 8 %).
+        </ParamField>
+
+        <ParamField body="monto" type="Decimal" required>
+          Pre-calculated tax amount for this line item (e.g., `800.00`).
+        </ParamField>
+      </Expandable>
+    </ParamField>
+
+    <ParamField body="total_item" type="Decimal" required>
+      Total value of this line including taxes (e.g., `21600.00`).
+    </ParamField>
+  </Expandable>
+</ParamField>
+
+<ParamField body="subtotal" type="Decimal" required>
+  Sum of all item prices **before** taxes. Must satisfy `subtotal + impuestos_totales + propina_voluntaria == total_factura`.
+</ParamField>
+
+<ParamField body="propina_voluntaria" type="Decimal" default="0.00">
+  Voluntary tip amount. Reported on the DIAN invoice but **excluded from the taxable base** — it is not subject to INC or IVA.
+</ParamField>
+
+<ParamField body="impuestos_totales" type="Decimal" required>
+  Total tax amount across all items. Must equal the sum of every `impuestos[].monto` value across all items.
+</ParamField>
+
+<ParamField body="total_factura" type="Decimal" required>
+  Final invoice total. Must exactly equal `subtotal + impuestos_totales + propina_voluntaria`. The use case enforces this invariant and raises a `ValueError` on mismatch.
+</ParamField>
+
+<ParamField body="metodos_pago" type="array" required>
+  Payment methods used to settle the invoice. Multiple entries are supported (e.g., partial cash + card).
+
+  <Expandable title="Payment method fields">
+    <ParamField body="tipo" type="string" required>
+      Payment type label. Common values: `"Efectivo"`, `"Tarjeta de Crédito"`, `"Tarjeta Débito"`, `"Transferencia"`.
+    </ParamField>
+
+    <ParamField body="monto" type="Decimal" required>
+      Amount paid via this payment method.
+    </ParamField>
+  </Expandable>
+</ParamField>
+
+## Business Validation
+
+The `FacturarPedidoLocalUseCase.execute()` method enforces the following rule before any SOAP call is made:
+
+```python
+expected_total = payload.subtotal + payload.impuestos_totales + payload.propina_voluntaria
+if payload.total_factura != expected_total:
+    raise ValueError("El total de la factura no coincide con la suma del subtotal, impuestos y propina.")
+```
+
+<Warning>
+  If `total_factura` does not match `subtotal + impuestos_totales + propina_voluntaria`, a `ValueError` is raised immediately and **no** DIAN submission is attempted. The audit log is not updated for failed validations of this type — ensure your POS system pre-validates totals before sending the request.
+</Warning>
+
+The voluntary tip (`propina_voluntaria`) is forwarded to the DIAN as an informational amount but is **never added to the taxable base** for INC or IVA purposes.
+
+## Response
+
+On `201 Created`, the endpoint returns a `PedidoLocalResponse` object.
+
+<ResponseField name="track_id" type="string">
+  DIAN's `ZipKey` identifier returned by `SendTestSetAsync`. Use this value to query DIAN's status portal for the submitted document. Defaults to `"UNKNOWN"` if the SOAP response does not include a `ZipKey`.
+</ResponseField>
+
+<ResponseField name="cufe" type="string">
+  Código Único de Factura Electrónica — the unique fingerprint of the issued invoice. Optional; populated only when the DIAN response includes it. In the current habilitación mock it returns `"VALID_CUFE_MOCK"`.
+</ResponseField>
+
+<ResponseField name="status" type="string">
+  Processing status string from the DIAN response (e.g., `"Procesado Correctamente"`, `"SUCCESS"`).
+</ResponseField>
+
+<ResponseField name="message" type="string">
+  Human-readable confirmation message (e.g., `"Factura enviada correctamente a la DIAN"`).
+</ResponseField>
+
+## Example Request
+
+The following example is derived from the canonical test fixture in `tests/application/use_cases/test_facturar_pedido_local.py`:
+
+```bash
+curl -X POST http://localhost:8000/api/v1/pedidos/consumo-local/ \
+  -H "Content-Type: application/json" \
+  -d '{
+    "id_pedido_origen": "POS-100",
+    "items": [
+      {
+        "id_producto": "B-01",
+        "descripcion": "Cerveza Artesanal",
+        "cantidad": 2,
+        "precio_unitario": 10000.00,
+        "impuestos": [
+          {"nombre": "INC", "tasa": 0.08, "monto": 1600.00}
+        ],
+        "total_item": 21600.00
+      }
+    ],
+    "subtotal": 20000.00,
+    "propina_voluntaria": 3000.00,
+    "impuestos_totales": 1600.00,
+    "total_factura": 24600.00,
+    "metodos_pago": [
+      {"tipo": "Efectivo", "monto": 24600.00}
+    ]
+  }'
+```
+
+**Total breakdown:** `20000.00 (subtotal) + 1600.00 (INC) + 3000.00 (tip) = 24600.00 ✓`
+
+## Example Response (201 Created)
+
+```json
+{
+  "track_id": "DIAN-ZIPKEY-ABC123",
+  "cufe": "VALID_CUFE_MOCK",
+  "status": "Procesado Correctamente",
+  "message": "Factura enviada correctamente a la DIAN"
+}
+```
+
+## Error Responses
+
+| HTTP Status | Cause | Body |
+|---|---|---|
+| `422 Unprocessable Entity` | Pydantic validation failed — missing required field, wrong type, or `cantidad ≤ 0` | Standard FastAPI validation error body |
+| `500 Internal Server Error` | DIAN submission failed — SOAP timeout, WSDL error, or authentication failure | `{"message": "Error enviando a la DIAN", "details": {...}}` |
+
+Example `500` body:
+
+```json
+{
+  "message": "Error enviando a la DIAN",
+  "details": {
+    "success": false,
+    "error": "TimeoutException",
+    "message": "La DIAN tardó demasiado en responder."
+  }
+}
+```
+
+## Tax Notes
+
+<Info>
+  **INC vs. IVA in Colombian restaurant invoicing:**
+
+  - **INC (Impuesto Nacional al Consumo)** — typically **8 %** for food and beverages served and consumed on the restaurant premises. This is the most common tax type for dine-in orders.
+  - **IVA (Impuesto al Valor Agregado)** — typically **19 %** for non-food items, alcohol in certain categories, or ancillary services. Some establishments apply a combination of both taxes depending on their tax registration.
+  - **Voluntary tip (`propina_voluntaria`)** — appears as a distinct line on the DIAN invoice but is **not subject to INC or IVA**. It is reported for transparency but does not increase the taxable base.
+
+  The `ImpuestoRequest.nombre` field on each item controls which tax type is applied per line, giving the POS full flexibility to mix INC and IVA items within the same invoice.
+</Info>

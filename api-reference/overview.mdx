@@ -1,0 +1,171 @@
+---
+title: "DIAN REST API Reference: Endpoints and Base URL"
+sidebarTitle: "Overview"
+description: "Base URL, available endpoints, response format conventions, and error codes for the DIAN REST API electronic invoicing service."
+---
+
+The DIAN REST API is a FastAPI-based REST service for submitting electronic invoices, credit notes, and debit notes to Colombia's DIAN tax authority via SOAP. All endpoints accept and return **JSON**. The API is built on [FastAPI](https://fastapi.tiangolo.com/) and exposes interactive, auto-generated documentation at `/docs` (Swagger UI) and `/redoc` (ReDoc) — no additional tooling required to explore the available operations.
+
+---
+
+## Base URL
+
+All requests are made to the host where the service is running. During local development the server binds on port `8000` by default:
+
+```bash
+http://localhost:8000
+```
+
+Every business endpoint is scoped under the `/api/v1` version prefix:
+
+```bash
+http://localhost:8000/api/v1
+```
+
+<Info>
+  The version prefix is defined directly on each `APIRouter`. The current router for dine-in orders uses `prefix="/api/v1/pedidos/consumo-local"`, ensuring all future routers follow the same `/api/v1/...` convention.
+</Info>
+
+---
+
+## Available Endpoints
+
+<CardGroup cols={2}>
+  <Card title="GET /health" icon="heart-pulse">
+    **Health Check**
+
+    Returns the current service status. Useful for load-balancer probes and uptime monitors. No request body required.
+
+    **Response:**
+    ```json
+    {
+      "status": "ok",
+      "message": "API is running 🚀"
+    }
+    ```
+  </Card>
+
+  <Card title="POST /api/v1/pedidos/consumo-local/" icon="receipt">
+    **Facturar Pedido de Consumo Local**
+
+    Submits a dine-in restaurant order (consumo local) for DIAN electronic invoicing. Accepts a full POS order payload, validates it, builds the XML invoice, and dispatches it to the DIAN SOAP service.
+
+    **Tag:** `Facturación Local`
+
+    Returns HTTP `201 Created` on success.
+  </Card>
+</CardGroup>
+
+<Note>
+  **Planned endpoints** — The following routes follow the same `/api/v1/pedidos/` pattern and are listed in the project vision as upcoming features:
+
+  | Method | Path | Description |
+  |--------|------|-------------|
+  | `POST` | `/api/v1/pedidos/domicilio/` | Submit a delivery order for DIAN invoicing |
+  | `POST` | `/api/v1/notas/credito/` | Issue a credit note (nota crédito) against an existing invoice |
+  | `POST` | `/api/v1/notas/debito/` | Issue a debit note (nota débito) against an existing invoice |
+
+  These endpoints are not yet implemented. The DIAN adapter already includes a `send_credit_note()` stub that currently returns `"Not implemented yet"`.
+</Note>
+
+---
+
+## Response Format
+
+All successful responses are JSON objects. The `POST /api/v1/pedidos/consumo-local/` endpoint returns HTTP `201 Created` with the following structure (defined by the `PedidoLocalResponse` Pydantic model):
+
+```json
+{
+  "track_id": "<DIAN ZipKey>",
+  "cufe": "<Código Único de Factura Electrónica>",
+  "status": "Procesado Correctamente",
+  "message": "Factura enviada correctamente a la DIAN"
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `track_id` | `string` | The `ZipKey` returned by the DIAN SOAP service (`SendTestSetAsync`). Used to query the invoice status later. |
+| `cufe` | `string \| null` | Código Único de Factura Electrónica. May be `null` in environments where the full XML signing pipeline is not yet active. |
+| `status` | `string` | Human-readable processing status, e.g. `"Procesado Correctamente"`. |
+| `message` | `string` | Confirmation message from the API. |
+
+The `GET /health` endpoint always returns HTTP `200 OK`:
+
+```json
+{
+  "status": "ok",
+  "message": "API is running 🚀"
+}
+```
+
+---
+
+## Error Responses
+
+When the DIAN SOAP submission fails, the controller returns HTTP `500 Internal Server Error` with a structured JSON body that wraps the raw adapter error:
+
+```json
+{
+  "message": "Error enviando a la DIAN",
+  "details": {
+    "success": false,
+    "error": "<error type>",
+    "message": "<error description>"
+  }
+}
+```
+
+**Example — DIAN connection timeout:**
+
+```json
+{
+  "message": "Error enviando a la DIAN",
+  "details": {
+    "success": false,
+    "error": "Timeout",
+    "message": "La DIAN tardó demasiado en responder."
+  }
+}
+```
+
+The `details` object maps directly to the dictionary returned by `DianSoapAdapter.send_invoice()`. The `error` field holds the Python exception class name (e.g. `"TimeoutException"`, `"ConnectionError"`).
+
+**HTTP status codes summary:**
+
+| Code | Meaning | When it occurs |
+|------|---------|----------------|
+| `200 OK` | Success | `GET /health` |
+| `201 Created` | Invoice submitted | `POST /api/v1/pedidos/consumo-local/` on DIAN success |
+| `422 Unprocessable Entity` | Validation failure | Pydantic rejects the request body (missing fields, wrong types, `total_factura` mismatch) |
+| `500 Internal Server Error` | DIAN submission failure | DIAN SOAP call raises an exception (timeout, auth error, malformed XML) |
+
+<Note>
+  The `422` response body is automatically generated by FastAPI and lists every field that failed validation, making it straightforward to debug malformed payloads during integration.
+</Note>
+
+---
+
+## Interactive Documentation
+
+FastAPI auto-generates fully interactive API documentation from the source code. No separate documentation deployment is needed during development.
+
+| Interface | URL | Description |
+|-----------|-----|-------------|
+| **Swagger UI** | `http://localhost:8000/docs` | Try requests directly in the browser. Includes example payloads for every field. |
+| **ReDoc** | `http://localhost:8000/redoc` | Clean, readable reference layout. Best for sharing with stakeholders. |
+| **OpenAPI JSON** | `http://localhost:8000/openapi.json` | Raw OpenAPI 3.x schema. Import into Postman, Insomnia, or any API client. |
+
+<Tip>
+  The FastAPI application is initialised with the following metadata in `src/main.py`:
+
+  ```python
+  app = FastAPI(
+      title="DIAN REST API",
+      description="API REST para el envío de facturas y notas a la DIAN",
+      version="1.0.0",
+  )
+  ```
+
+  This metadata is reflected in the Swagger UI title bar, the ReDoc header, and the `info` block of the OpenAPI JSON schema.
+</Tip>

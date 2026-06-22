@@ -1,0 +1,290 @@
+---
+title: "PedidoLocalCreateRequest: Dine-In Order Request Schema"
+sidebarTitle: "PedidoLocal Schema"
+description: "Full schema reference for PedidoLocalCreateRequest — the Pydantic request model used to submit dine-in restaurant orders for DIAN electronic invoicing."
+---
+
+`PedidoLocalCreateRequest` is the Pydantic v2 model used as the request body for `POST /api/v1/pedidos/consumo-local/`. It captures all details of a restaurant's dine-in order that are required to generate a DIAN-compliant electronic invoice, including line items with per-item tax breakdowns, buyer identification, payment methods, and pre-calculated totals that are validated against a strict business rule before the document is forwarded to DIAN via SOAP.
+
+---
+
+## Full Schema
+
+The following classes are defined in `src/infrastructure/controllers/schemas/pedido_local_schema.py`. They act as HTTP-layer DTOs that are kept intentionally separate from the domain entities so that REST-specific serialization concerns stay out of the core domain.
+
+```python
+from pydantic import BaseModel, Field
+from typing import List, Optional
+from decimal import Decimal
+
+class ImpuestoRequest(BaseModel):
+    nombre: str = Field(..., json_schema_extra={"example": "INC"})
+    tasa: Decimal = Field(..., json_schema_extra={"example": 0.08})
+    monto: Decimal = Field(..., json_schema_extra={"example": 800.0})
+
+class ItemPedidoRequest(BaseModel):
+    id_producto: str = Field(..., json_schema_extra={"example": "PROD-001"})
+    descripcion: str = Field(..., json_schema_extra={"example": "Hamburguesa Sencilla"})
+    cantidad: int = Field(..., gt=0, json_schema_extra={"example": 2})
+    precio_unitario: Decimal = Field(..., json_schema_extra={"example": 10000.0})
+    impuestos: List[ImpuestoRequest]
+    total_item: Decimal = Field(..., json_schema_extra={"example": 21600.0})
+
+class PagoRequest(BaseModel):
+    tipo: str = Field(..., json_schema_extra={"example": "Tarjeta de Crédito"})
+    monto: Decimal = Field(..., json_schema_extra={"example": 25000.0})
+
+class AdquirenteRequest(BaseModel):
+    tipo_documento: str = Field(default="13", json_schema_extra={"example": "13"})
+    numero_documento: str = Field(default="222222222222", json_schema_extra={"example": "1001234567"})
+    razon_social: str = Field(default="Consumidor Final", json_schema_extra={"example": "Juan Perez"})
+
+class PedidoLocalCreateRequest(BaseModel):
+    id_pedido_origen: str = Field(..., description="ID del pedido en el POS del restaurante")
+    adquirente: Optional[AdquirenteRequest] = Field(
+        default=None,
+        description="Datos del cliente. Si se omite, se usa Consumidor Final."
+    )
+    items: List[ItemPedidoRequest] = Field(..., min_length=1)
+    subtotal: Decimal = Field(..., json_schema_extra={"example": 20000.0})
+    propina_voluntaria: Decimal = Field(default=Decimal('0.00'), json_schema_extra={"example": 3000.0})
+    impuestos_totales: Decimal = Field(..., json_schema_extra={"example": 1600.0})
+    total_factura: Decimal = Field(..., json_schema_extra={"example": 24600.0})
+    metodos_pago: List[PagoRequest]
+```
+
+---
+
+## Field Reference
+
+### Top-Level Fields
+
+<ParamField body="id_pedido_origen" type="string" required>
+  The unique order ID from the originating POS system. This is stored as `id_pedido` on the `PedidoLocal` domain entity and is used to correlate the DIAN submission back to the source transaction.
+
+  **Example:** `"PROD-001"`
+</ParamField>
+
+<ParamField body="adquirente" type="AdquirenteRequest" optional>
+  Customer identification block. If omitted entirely, `FacturarPedidoLocalUseCase` defaults to an `Adquirente()` instance representing **Consumidor Final** — the anonymous buyer code required by DIAN for retail transactions where the customer does not provide identification.
+
+  <Expandable title="AdquirenteRequest fields">
+    <ParamField body="tipo_documento" type="string" default="13">
+      DIAN document type code.
+
+      | Value | Meaning |
+      |-------|---------|
+      | `"13"` | Cédula de Ciudadanía |
+      | `"31"` | NIT (Número de Identificación Tributaria) |
+      | `"22"` | Cédula de Extranjería |
+    </ParamField>
+
+    <ParamField body="numero_documento" type="string" default="222222222222">
+      The buyer's document number. The default `"222222222222"` is the DIAN-designated placeholder for Consumidor Final.
+
+      **Example:** `"1001234567"`
+    </ParamField>
+
+    <ParamField body="razon_social" type="string" default="Consumidor Final">
+      The buyer's full name or registered business name.
+
+      **Example:** `"Juan Perez"` or `"Restaurantes ABC S.A.S."`
+    </ParamField>
+  </Expandable>
+</ParamField>
+
+<ParamField body="items" type="ItemPedidoRequest[]" required>
+  Array of line items in the order. Must contain **at least one item** (`min_length=1`). Each element fully describes one product including its individual tax breakdown.
+
+  <Expandable title="ItemPedidoRequest fields">
+    <ParamField body="id_producto" type="string" required>
+      Internal product identifier from the POS catalog.
+
+      **Example:** `"PROD-001"`
+    </ParamField>
+
+    <ParamField body="descripcion" type="string" required>
+      Human-readable product description that will appear on the electronic invoice.
+
+      **Example:** `"Hamburguesa Sencilla"`
+    </ParamField>
+
+    <ParamField body="cantidad" type="integer" required>
+      Quantity ordered. Must be greater than `0` (enforced by Pydantic `gt=0`). Sending `0` will return a `422 Unprocessable Entity`.
+
+      **Example:** `2`
+    </ParamField>
+
+    <ParamField body="precio_unitario" type="Decimal" required>
+      Unit price of the product **before taxes**, in Colombian Pesos (COP).
+
+      **Example:** `10000.0`
+    </ParamField>
+
+    <ParamField body="impuestos" type="ImpuestoRequest[]" required>
+      List of taxes applicable to this specific line item. Colombia's DIAN supports multiple concurrent tax types per item.
+
+      <Expandable title="ImpuestoRequest fields">
+        <ParamField body="nombre" type="string" required>
+          Tax identifier name. Common values:
+
+          | Value | Meaning |
+          |-------|---------|
+          | `"INC"` | Impuesto Nacional al Consumo (8% on food/beverages) |
+          | `"IVA"` | Impuesto sobre las Ventas (19% standard rate) |
+        </ParamField>
+
+        <ParamField body="tasa" type="Decimal" required>
+          Tax rate expressed as a decimal fraction, not a percentage.
+
+          **Example:** `0.08` for 8% INC, `0.19` for 19% IVA
+        </ParamField>
+
+        <ParamField body="monto" type="Decimal" required>
+          Pre-calculated monetary tax amount for this line item, in COP. The API does **not** recalculate this value — it trusts the POS to send a correct pre-computed amount.
+
+          **Example:** `1600.0` (= 2 × 10000 × 0.08)
+        </ParamField>
+      </Expandable>
+    </ParamField>
+
+    <ParamField body="total_item" type="Decimal" required>
+      Total cost of this line item including all taxes (`precio_unitario × cantidad + sum(impuestos.monto)`).
+
+      **Example:** `21600.0`
+    </ParamField>
+  </Expandable>
+</ParamField>
+
+<ParamField body="subtotal" type="Decimal" required>
+  Sum of all `precio_unitario × cantidad` values across all items, **before taxes**. Used as the taxable base for DIAN invoice generation.
+
+  **Example:** `20000.0`
+</ParamField>
+
+<ParamField body="propina_voluntaria" type="Decimal" default="0.00">
+  Voluntary tip amount. Per Colombian tax regulation, tips are **not part of the taxable base** and are excluded from tax calculations. The use case validates that `total_factura = subtotal + impuestos_totales + propina_voluntaria`.
+
+  **Example:** `3000.0`
+</ParamField>
+
+<ParamField body="impuestos_totales" type="Decimal" required>
+  Sum of all `monto` values across all `impuestos` across all items. Must be consistent with the item-level tax detail.
+
+  **Example:** `1600.0`
+</ParamField>
+
+<ParamField body="total_factura" type="Decimal" required>
+  Grand total of the invoice. **Business rule enforced by `FacturarPedidoLocalUseCase`:** this value must exactly equal `subtotal + impuestos_totales + propina_voluntaria`. A mismatch raises a `ValueError` before any DIAN call is made.
+
+  **Example:** `24600.0` (= 20000 + 1600 + 3000)
+</ParamField>
+
+<ParamField body="metodos_pago" type="PagoRequest[]" required>
+  One or more payment methods used to settle the order. Split-tender (e.g., partial cash + partial card) is supported by providing multiple entries.
+
+  <Expandable title="PagoRequest fields">
+    <ParamField body="tipo" type="string" required>
+      Payment method label. Common values: `"Efectivo"`, `"Tarjeta de Crédito"`, `"Tarjeta Débito"`, `"Transferencia"`.
+    </ParamField>
+
+    <ParamField body="monto" type="Decimal" required>
+      Amount settled with this payment method, in COP.
+
+      **Example:** `24600.0`
+    </ParamField>
+  </Expandable>
+</ParamField>
+
+<Info>
+  `Decimal` types are used for all monetary values to avoid floating-point precision issues in tax calculations. Always send monetary amounts as JSON numbers with up to two decimal places (e.g., `10000.00`), not as strings.
+</Info>
+
+---
+
+## Complete Example
+
+The following is a complete, valid request body for a two-beer order paid by credit card, with INC tax and a voluntary tip:
+
+```json
+{
+  "id_pedido_origen": "POS-100",
+  "adquirente": {
+    "tipo_documento": "13",
+    "numero_documento": "1001234567",
+    "razon_social": "Juan Perez"
+  },
+  "items": [
+    {
+      "id_producto": "B-01",
+      "descripcion": "Cerveza Artesanal",
+      "cantidad": 2,
+      "precio_unitario": 10000.00,
+      "impuestos": [
+        {"nombre": "INC", "tasa": 0.08, "monto": 1600.00}
+      ],
+      "total_item": 21600.00
+    }
+  ],
+  "subtotal": 20000.00,
+  "propina_voluntaria": 3000.00,
+  "impuestos_totales": 1600.00,
+  "total_factura": 24600.00,
+  "metodos_pago": [
+    {"tipo": "Tarjeta de Crédito", "monto": 24600.00}
+  ]
+}
+```
+
+---
+
+## Domain Entity Mapping
+
+`FacturarPedidoLocalUseCase.execute()` maps the incoming `PedidoLocalCreateRequest` DTO to the `PedidoLocal` domain entity before performing any business logic. This separation ensures that REST-layer concerns (Pydantic field aliases, HTTP examples, JSON serialization) never leak into the domain model.
+
+The mapping produces the following domain entity (defined in `src/domain/entities/pedido_local.py`):
+
+```python
+from decimal import Decimal
+from typing import List
+from pydantic import BaseModel, Field
+
+class ConceptoImpuesto(BaseModel):
+    nombre: str = Field(..., description="Nombre del impuesto, e.g., INC, IVA")
+    tasa: Decimal = Field(..., description="Tasa del impuesto, e.g., 0.08 para 8%")
+    monto: Decimal = Field(..., description="Valor calculado del impuesto")
+
+class ItemPedido(BaseModel):
+    id_producto: str
+    descripcion: str
+    cantidad: int
+    precio_unitario: Decimal
+    impuestos: List[ConceptoImpuesto] = Field(default_factory=list)
+    total_item: Decimal
+
+class MetodoPago(BaseModel):
+    tipo: str = Field(..., description="Efectivo, Tarjeta, Transferencia, etc")
+    monto: Decimal
+
+class Adquirente(BaseModel):
+    tipo_documento: str = Field(default="13", description="Tipo de documento (13=CC, 31=NIT, etc.)")
+    numero_documento: str = Field(default="222222222222", description="Número de identificación")
+    razon_social: str = Field(default="Consumidor Final", description="Nombre o Razón social")
+
+class PedidoLocal(BaseModel):
+    id_pedido: str
+    adquirente: Adquirente = Field(default_factory=Adquirente, description="Datos del cliente")
+    items: List[ItemPedido]
+    subtotal: Decimal
+    propina_voluntaria: Decimal = Field(
+        default=Decimal('0.00'),
+        description="Propina, no hace parte de base gravable"
+    )
+    impuestos_totales: Decimal
+    total_factura: Decimal
+    metodos_pago: List[MetodoPago]
+
+    # Regla: puramente entidad de dominio, sin base de datos o lógica externa.
+```
+
+Notice the key field name difference: `PedidoLocalCreateRequest.id_pedido_origen` (the POS-originated ID) maps to `PedidoLocal.id_pedido`. All nested objects use domain-specific class names (`ConceptoImpuesto` instead of `ImpuestoRequest`, `MetodoPago` instead of `PagoRequest`) to keep the domain vocabulary clean and independent of HTTP concerns.

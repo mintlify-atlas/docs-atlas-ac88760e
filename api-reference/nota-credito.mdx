@@ -1,0 +1,93 @@
+---
+title: "POST /api/v1/notas-credito/ — Issue a Credit Note Against an Invoice"
+sidebarTitle: "POST /nota-credito"
+description: "Submit a credit note to DIAN that voids or adjusts a previously issued electronic invoice. Requires the original invoice's CUFE. Currently planned."
+---
+
+Credit notes (*Notas Crédito*) are the DIAN-approved mechanism for voiding, correcting, or partially reversing an electronic invoice. Under Colombian tax law, a credit note does not replace the original document — it creates an adjustment record that references the original invoice by its **CUFE** (Código Único de Factura Electrónica). Every credit note must therefore carry the CUFE of the invoice it corrects, and must discriminate the exact tax amounts being reversed on the affected line items.
+
+<Warning>
+  This endpoint is **planned but not yet implemented**. The `IDianSoapPort.send_credit_note()` method in `DianSoapAdapter` currently returns `{"success": False, "message": "Not implemented yet"}`. This page documents the planned interface based on the project's feature specification in `docs/features/nota_credito_restaurante.md`.
+</Warning>
+
+## Planned Endpoint
+
+| Property | Value |
+|---|---|
+| **Method** | `POST` |
+| **Path** | `/api/v1/notas-credito/` *(planned)* |
+| **Tags** | `Facturación Local` |
+| **Success status** | `201 Created` *(planned)* |
+
+## Business Rules
+
+The following rules are derived from the project feature spec (*Historia de Usuario 3: Devoluciones y Notas Crédito*):
+
+<Steps>
+  <Step title="Reference the original CUFE">
+    Every credit note must include `cufe_original` — the CUFE of the electronic invoice being corrected. DIAN uses this to link the adjustment to the original document in their audit trail.
+  </Step>
+
+  <Step title="Discriminate taxes on corrected items">
+    The credit note payload must explicitly list the tax amounts being reversed (INC and/or IVA) on each corrected item. It is not sufficient to reverse only the net amount — the tax breakdown must mirror the structure of the original invoice line items.
+  </Step>
+
+  <Step title="Exclude the voluntary tip">
+    The voluntary tip (`propina_voluntaria`) is **not reversed** by a credit note. Because the tip is not part of the taxable base on the original invoice, it is excluded from any tax base adjustments in the correction document.
+  </Step>
+
+  <Step title="Applicable correction scenarios">
+    Credit notes are applicable for, but not limited to:
+    - **Order cancellations** — the entire invoice is voided after submission.
+    - **Incorrect charges** — a product was billed that was not delivered.
+    - **Returned items** — a dish was returned due to poor quality or preparation error.
+    - **Pricing errors** — a wrong unit price was applied at point of sale.
+  </Step>
+</Steps>
+
+## Planned Request Body
+
+The following fields represent the expected structure of the credit note request, consistent with DIAN's electronic invoicing standard and the project feature specification.
+
+<ParamField body="cufe_original" type="string" required>
+  The CUFE of the previously issued electronic invoice that this credit note is correcting. This value is returned by the `/api/v1/pedidos/consumo-local/` endpoint at billing time and must be stored by the POS system.
+</ParamField>
+
+<ParamField body="motivo_correccion" type="string" required>
+  DIAN correction reason code or description. Identifies why the credit note is being issued (e.g., `"1"` for partial reversal, `"2"` for full cancellation, per DIAN codification).
+</ParamField>
+
+<ParamField body="items_corregidos" type="array">
+  The items being reversed or adjusted. Each entry follows the same structure as the `ItemPedidoRequest` in the invoice endpoint — with `id_producto`, `descripcion`, `cantidad`, `precio_unitario`, `impuestos` (INC/IVA breakdown), and `total_item`. Only the items actually being corrected need to be included.
+</ParamField>
+
+## Current Adapter Stub
+
+The `DianSoapAdapter` in `src/infrastructure/adapters/dian_soap/dian_adapter.py` contains the following stub for the credit note operation:
+
+```python
+async def send_credit_note(self, note_data: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Envía una nota crédito a la DIAN.
+    """
+    # Comparte la misma naturaleza del send_invoice
+    return {
+        "success": False,
+        "message": "Not implemented yet"
+    }
+```
+
+The `IDianSoapPort` protocol (defined in `src/application/ports/dian_port.py`) already declares the `send_credit_note` method signature:
+
+```python
+class IDianSoapPort(Protocol):
+    async def send_invoice(self, invoice_data: Dict[str, Any]) -> Dict[str, Any]:
+        ...
+
+    async def send_credit_note(self, note_data: Dict[str, Any]) -> Dict[str, Any]:
+        ...
+```
+
+<Note>
+  The `IDianSoapPort` protocol is already wired and the `send_credit_note` method signature is fully defined — no interface changes are required to begin the implementation. The credit note SOAP adapter (`DianSoapAdapter.send_credit_note`) is the **next implementation milestone** after the invoice adapter (`send_invoice`) is validated and approved in DIAN's habilitación (testing) environment. Once habilitación sign-off is obtained, the same `SendTestSetAsync` → `SendBillAsync` promotion pattern used for invoices will be applied to credit notes.
+</Note>

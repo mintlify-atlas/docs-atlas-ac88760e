@@ -1,0 +1,145 @@
+---
+title: "PedidoLocalResponse: Invoice Submission Response Schema"
+sidebarTitle: "Response Schema"
+description: "Reference for PedidoLocalResponse — the response schema returned by DIAN REST API after submitting an electronic invoice, including track_id, CUFE, and status."
+---
+
+`PedidoLocalResponse` is the Pydantic model returned by `POST /api/v1/pedidos/consumo-local/` on a successful DIAN submission. It wraps DIAN's native response identifiers — the `ZipKey` tracking ID and the CUFE cryptographic hash — in a clean, typed structure that abstracts away the raw SOAP response format and provides a consistent JSON envelope for your POS integration to consume.
+
+---
+
+## Response Schema
+
+The class is defined alongside the request models in `src/infrastructure/controllers/schemas/pedido_local_schema.py`:
+
+```python
+from pydantic import BaseModel
+from typing import Optional
+
+class PedidoLocalResponse(BaseModel):
+    track_id: str
+    cufe: Optional[str] = None
+    status: str
+    message: str
+```
+
+---
+
+## Field Reference
+
+<ResponseField name="track_id" type="string" required>
+  DIAN's `ZipKey` returned by `SendTestSetAsync` (habilitación) or the equivalent production operation. This is the identifier of the submitted ZIP package containing the signed XML invoice. Use it to query DIAN's service for the final asynchronous processing status of the document.
+
+  **Example:** `"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"`
+</ResponseField>
+
+<ResponseField name="cufe" type="string">
+  **Código Único de Factura Electrónica.** The official DIAN-assigned identifier for a validated electronic invoice. It is a cryptographic hash derived from the invoice data and the issuer's digital certificate. The CUFE must be printed on all physical and digital receipt copies to comply with Colombian electronic invoicing regulation.
+
+  This field may be `null` during habilitación (testing) mode — DIAN's test environment returns mock data and does not always issue a real CUFE.
+
+  **Example:** `"VALID_CUFE_MOCK"`
+</ResponseField>
+
+<ResponseField name="status" type="string" required>
+  Processing status string returned by DIAN, passed through directly from the SOAP adapter response. Common values observed in the habilitación environment include `"Procesado Correctamente"` and `"SUCCESS"`. In production this reflects the actual DIAN processing outcome.
+
+  **Example:** `"Procesado Correctamente"`
+</ResponseField>
+
+<ResponseField name="message" type="string" required>
+  Human-readable summary message set by the controller. On a successful submission the controller sets this to `"Factura enviada correctamente a la DIAN"`. The use case itself uses `"Factura procesada con éxito."` when constructing the response object internally.
+
+  **Example:** `"Factura enviada correctamente a la DIAN"`
+</ResponseField>
+
+---
+
+## Example Responses
+
+<Tabs>
+  <Tab title="Success (201)">
+    Returned when DIAN accepted the submitted document. HTTP status is `201 Created`.
+
+    ```json
+    {
+      "track_id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+      "cufe": "VALID_CUFE_MOCK",
+      "status": "Procesado Correctamente",
+      "message": "Factura enviada correctamente a la DIAN"
+    }
+    ```
+  </Tab>
+
+  <Tab title="DIAN Error (500)">
+    Returned when the DIAN SOAP adapter fails — due to a timeout, WSDL error, or DIAN service rejection. HTTP status is `500 Internal Server Error`. The `details` object contains the raw adapter error payload.
+
+    ```json
+    {
+      "message": "Error enviando a la DIAN",
+      "details": {
+        "success": false,
+        "error": "Timeout",
+        "message": "La DIAN tardó demasiado en responder."
+      }
+    }
+    ```
+  </Tab>
+
+  <Tab title="Validation Error (422)">
+    Returned by FastAPI automatically when the request body fails Pydantic schema validation — for example, a missing required field or a value that violates a type or constraint rule. HTTP status is `422 Unprocessable Entity`.
+
+    ```json
+    {
+      "detail": [
+        {
+          "type": "missing",
+          "loc": ["body", "id_pedido_origen"],
+          "msg": "Field required",
+          "input": {}
+        }
+      ]
+    }
+    ```
+  </Tab>
+</Tabs>
+
+---
+
+## What is the CUFE?
+
+The **CUFE** (Código Único de Factura Electrónica) is the cryptographic hash that DIAN assigns to each validated electronic invoice document. It is derived from a concatenation of key invoice fields — including the invoice number, issue date, total amounts, tax values, and the issuer's NIT — and is signed using the issuer's digital certificate.
+
+The CUFE serves as the **official legal identifier** for the invoice and has the following significance:
+
+- It must be printed on all physical and digital receipt copies given to the customer.
+- It is used to look up the invoice on the DIAN portal for verification.
+- Its presence confirms that DIAN has validated and accepted the document — a document without a confirmed CUFE is not legally binding as an electronic invoice.
+- During **habilitación** (testing) mode, DIAN returns a mock CUFE (or `null`). Only invoices submitted through the production endpoint receive a real, legally valid CUFE.
+
+<Note>
+  The `cufe` field is typed as `Optional[str]` because DIAN's habilitación environment does not always return a real CUFE hash. Your POS integration should handle `null` gracefully during testing and only enforce CUFE presence in production workflows.
+</Note>
+
+---
+
+## Using the track_id
+
+After a successful submission, the `track_id` (DIAN `ZipKey`) is your handle for querying the asynchronous processing status of the submitted ZIP file from DIAN's validation pipeline.
+
+**How the flow works:**
+
+1. Your POS sends `POST /api/v1/pedidos/consumo-local/` with the invoice payload.
+2. DIAN REST API builds a signed XML invoice, packages it as a ZIP, and calls `SendTestSetAsync` (habilitación) or the equivalent production SOAP method.
+3. DIAN returns a `ZipKey` immediately — this becomes the `track_id` in the response.
+4. DIAN then validates the document **asynchronously**. The final processing result (including the confirmed CUFE) is available by querying DIAN's `GetStatusZip` endpoint using the `track_id`.
+
+**Important caveats:**
+
+- In **habilitación** testing, the response is mock data and `track_id` values are not queryable against real DIAN systems.
+- In **production**, the CUFE is only issued after DIAN's asynchronous validation completes. There may be a delay of seconds to minutes between submission and CUFE issuance.
+- DIAN REST API currently returns the `track_id` but does not expose a dedicated status-query endpoint. Implement polling against DIAN's SOAP `GetStatusZip` directly if your workflow requires confirmed CUFE retrieval.
+
+<Warning>
+  Do not mark an invoice as "confirmed" in your POS system based solely on receiving a `track_id`. Wait until DIAN's asynchronous validation returns a confirmed CUFE before treating the transaction as legally invoiced.
+</Warning>

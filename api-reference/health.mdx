@@ -1,0 +1,60 @@
+---
+title: "GET /health — DIAN REST API Health Check Endpoint"
+sidebarTitle: "GET /health"
+description: "GET /health returns the current status of the DIAN REST API service. Use it for liveness probes and uptime monitoring."
+---
+
+The `/health` endpoint confirms the API is running and accepting requests. It is a lightweight, unauthenticated probe designed for load balancer health checks, Kubernetes liveness probes, and uptime monitoring dashboards. No credentials are required and no database queries are performed — the response is returned directly by the FastAPI application layer.
+
+## Endpoint
+
+| Property | Value |
+|---|---|
+| **Method** | `GET` |
+| **Path** | `/health` |
+| **Auth** | None required |
+| **Tags** | *(root-level — not mounted under `/api/v1`)* |
+
+## Response
+
+A successful probe returns HTTP `200 OK` with a JSON body confirming service availability.
+
+| Property | Value |
+|---|---|
+| **HTTP Status** | `200 OK` |
+| **Content-Type** | `application/json` |
+
+```json
+{
+  "status": "ok",
+  "message": "API is running 🚀"
+}
+```
+
+## Example
+
+Send a `GET` request to `/health` with `curl`:
+
+```bash
+curl http://localhost:8000/health
+```
+
+Expected response:
+
+```json
+{"status": "ok", "message": "API is running 🚀"}
+```
+
+## Source
+
+The route is registered directly on the root `FastAPI` application instance in `src/main.py`:
+
+```python
+@app.get("/health", summary="Health Check")
+async def health_check():
+    return JSONResponse(content={"status": "ok", "message": "API is running 🚀"})
+```
+
+<Note>
+  Because `/health` is mounted at the application root (not behind the `/api/v1` router prefix), it is always reachable regardless of which versioned routers are active. This makes it safe to use as both a liveness and a readiness probe in containerised deployments.
+</Note>

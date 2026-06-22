@@ -1,0 +1,152 @@
+---
+title: "Configure DIAN REST API: Environment Variables and Certificate Setup"
+sidebarTitle: "Configuration"
+description: "All environment variables for DIAN REST API — certificate path, credentials, WSDL URLs, and environment flag — with validation behavior explained."
+---
+
+DIAN REST API uses **Pydantic Settings** (`pydantic-settings`) to load and validate every configuration value from environment variables at application startup. The `Settings` class in `src/infrastructure/config/settings.py` is instantiated once when the module is imported — meaning all validations run before the first request is ever served. If any required variable is missing, has an incorrect type, or if the PFX certificate cannot be loaded with the provided password, the application raises an exception and **refuses to start**. There is no way to defer or skip this validation.
+
+## Environment Variables
+
+<ParamField body="DIAN_CERT_PATH" type="FilePath" required>
+  Absolute path on the server's filesystem to the DIAN digital certificate file in PFX (PKCS#12) format. Pydantic validates that this path exists and points to a file before the `@model_validator` runs. Use an absolute path — relative paths are not recommended and may behave differently depending on the working directory.
+
+  ```env
+  DIAN_CERT_PATH=/ruta/absoluta/al/certificado.pfx
+  ```
+</ParamField>
+
+<ParamField body="DIAN_CERT_PASSWORD" type="SecretStr" required>
+  Password used to decrypt the PFX certificate file. Pydantic stores this value as a `SecretStr` — its raw value is never included in logs, tracebacks, or serialized representations of the `Settings` object. The plain-text value is only exposed internally via `.get_secret_value()` when constructing the SOAP adapter.
+
+  ```env
+  DIAN_CERT_PASSWORD=password_segura
+  ```
+</ParamField>
+
+<ParamField body="DIAN_TEST_SET_ID" type="string" required>
+  The Test Set ID assigned by DIAN during the software habilitación (registration) process. This UUID-formatted identifier is submitted as part of the SOAP envelope to associate the invoice with your registered test set. Provided by DIAN's *Facturación Electrónica* portal.
+
+  ```env
+  DIAN_TEST_SET_ID=xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
+  ```
+</ParamField>
+
+<ParamField body="DIAN_SOFTWARE_ID" type="string" required>
+  The Software ID (UUID) that identifies your billing software as registered with DIAN. Every electronic document submitted to DIAN must be associated with a registered `SoftwareID`. This value is provided when you complete the DIAN software registration.
+
+  ```env
+  DIAN_SOFTWARE_ID=xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
+  ```
+</ParamField>
+
+<ParamField body="DIAN_SOFTWARE_PIN" type="string" required>
+  The Software PIN that authenticates your billing software against DIAN's web services. Used alongside `DIAN_SOFTWARE_ID` to construct the SOAP security header for each request.
+
+  ```env
+  DIAN_SOFTWARE_PIN=12345
+  ```
+</ParamField>
+
+<ParamField body="ENVIRONMENT" type="string" default="local">
+  Runtime environment flag that controls which DIAN WSDL endpoint receives invoice submissions. Any value other than `"production"` routes requests to the habilitación (testing) service. Set to `"production"` only when you are ready to submit legally binding fiscal documents to DIAN's live service.
+
+  Accepted values: `local`, `staging`, `production` (or any custom string — only `"production"` triggers the production WSDL).
+
+  ```env
+  ENVIRONMENT=local
+  ```
+</ParamField>
+
+<ParamField body="DIAN_WSDL_URL_HABILITACION" type="string" required>
+  Full URL of the DIAN SOAP WSDL for the habilitación (testing) environment. This endpoint is used when `ENVIRONMENT` is set to any value other than `"production"`. The default points to DIAN's official testing service.
+
+  ```env
+  DIAN_WSDL_URL_HABILITACION=https://vpfe-hab.dian.gov.co/WcfDianCustomerServices.mac/WcfDianCustomerServices.svc?wsdl
+  ```
+</ParamField>
+
+<ParamField body="DIAN_WSDL_URL_PRODUCCION" type="string" required>
+  Full URL of the DIAN SOAP WSDL for the production environment. This endpoint is only used when `ENVIRONMENT=production`. The default points to DIAN's official live service.
+
+  ```env
+  DIAN_WSDL_URL_PRODUCCION=https://vpfe.dian.gov.co/WcfDianCustomerServices.mac/WcfDianCustomerServices.svc?wsdl
+  ```
+</ParamField>
+
+## Certificate Validation
+
+When `Settings` is instantiated, a `@model_validator(mode="after")` method (`validate_pfx_certificate`) immediately attempts to open the file at `DIAN_CERT_PATH` and decrypt it using `DIAN_CERT_PASSWORD`. Internally it calls:
+
+```python
+from cryptography.hazmat.primitives.serialization import pkcs12
+
+pkcs12.load_key_and_certificates(
+    pfx_data,
+    password.encode("utf-8") if password else None,
+)
+```
+
+If this call succeeds, startup continues normally. If it fails for any reason — the file does not exist, is not a valid PFX, or the password is incorrect — a `ValueError` is raised with a descriptive message and the application process exits immediately:
+
+```
+ValueError: Failed to load the PFX certificate at /ruta/absoluta/al/certificado.pfx.
+Ensure the path is correct, the file is a valid PFX, and the password is correct.
+Error: [underlying cryptography error]
+```
+
+This **fast-fail** design guarantees that the server never starts in a state where it would silently fail to sign documents on the first invoice request. Always resolve certificate errors before deploying.
+
+## WSDL Environment Routing
+
+The `pedido_local_controller.py` controller selects the correct WSDL URL each time a request is processed, using a simple conditional:
+
+```python
+wsdl = (
+    settings.DIAN_WSDL_URL_HABILITACION
+    if settings.ENVIRONMENT != "production"
+    else settings.DIAN_WSDL_URL_PRODUCCION
+)
+```
+
+This means:
+
+| `ENVIRONMENT` value | WSDL used |
+|---|---|
+| `local` (default) | `https://vpfe-hab.dian.gov.co/WcfDianCustomerServices.mac/WcfDianCustomerServices.svc?wsdl` |
+| `staging` | `https://vpfe-hab.dian.gov.co/WcfDianCustomerServices.mac/WcfDianCustomerServices.svc?wsdl` |
+| `production` | `https://vpfe.dian.gov.co/WcfDianCustomerServices.mac/WcfDianCustomerServices.svc?wsdl` |
+
+The WSDL selection happens at the dependency injection level, so no code changes are required when promoting from testing to production — only the `ENVIRONMENT` variable in your deployment configuration needs to change.
+
+## Configuration file
+
+A complete `.env` file for local development:
+
+```env
+# Path to your DIAN PFX digital certificate
+DIAN_CERT_PATH=/ruta/absoluta/al/certificado.pfx
+
+# Password for the PFX certificate — keep this secret
+DIAN_CERT_PASSWORD=password_segura
+
+# DIAN habilitación credentials
+DIAN_TEST_SET_ID=xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
+DIAN_SOFTWARE_ID=xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
+DIAN_SOFTWARE_PIN=12345
+
+# Runtime environment: any value other than "production" uses the habilitación WSDL
+ENVIRONMENT=local
+
+# DIAN SOAP WSDL endpoints
+DIAN_WSDL_URL_HABILITACION=https://vpfe-hab.dian.gov.co/WcfDianCustomerServices.mac/WcfDianCustomerServices.svc?wsdl
+DIAN_WSDL_URL_PRODUCCION=https://vpfe.dian.gov.co/WcfDianCustomerServices.mac/WcfDianCustomerServices.svc?wsdl
+```
+
+<Warning>
+  **Never commit `.env` to version control.** The file contains `DIAN_CERT_PASSWORD` and your DIAN software credentials — both are highly sensitive. Add `.env` to your `.gitignore` immediately. Use a secrets manager (AWS Secrets Manager, HashiCorp Vault, etc.) or your CI/CD platform's secret injection mechanism for staging and production deployments.
+</Warning>
+
+<Note>
+  The `Settings` class is configured with `extra="ignore"` in its `model_config`. This means any environment variables present in your shell or `.env` file that are **not** declared as fields on `Settings` are silently ignored — they will not cause a validation error. This makes it safe to run the application in environments that have many unrelated environment variables set (for example, a shared CI runner or a container with platform-injected variables).
+</Note>

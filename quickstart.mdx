@@ -1,47 +1,158 @@
 ---
-title: "Quickstart"
-description: "Begin with a guide on the fastest path to a successful outcome"
+title: "Get Started with DIAN REST API in 5 Minutes"
+sidebarTitle: "Quickstart"
+description: "Install dependencies, configure your DIAN credentials, start the FastAPI server, and submit your first electronic invoice in a few steps."
 ---
 
-Describe how someone begins using your product. What is the first thing they need to do? Are there any prerequisites?
-
-A quickstart should take someone from zero to using your product. They'll get a quick win and a sense of what they can accomplish.
-
-## Prerequisites
-
-Before you begin, you must have:
-
-- Requirement one (for example, Node.js 18+, a free account, an API key)
-- Requirement two (for example, a compatible device, a compatible browser, a compatible operating system)
-
-## Get started
+This guide walks you through everything needed to run DIAN REST API locally and send your first electronic invoice to DIAN's habilitación (testing) environment. By the end you will have a running FastAPI server, a validated PFX certificate loaded on startup, and a confirmed SOAP round-trip to DIAN's testing service.
 
 <Steps>
-  <Step title="Install">
-    Describe how to install your product or sign up.
+  <Step title="Prerequisites">
+    Before you begin, make sure you have the following:
+
+    - **Python 3.14 or later** — required by `pyproject.toml`.
+    - **`uv` package manager** — used exclusively for dependency management and virtual environments. Install it with:
 
     ```bash
-    npm install your-package
+    curl -LsSf https://astral.sh/uv/install.sh | sh
+    ```
+
+    - **A valid DIAN `.pfx` digital certificate** — issued during the DIAN software registration process. This file is required for XML signing and SOAP authentication. Keep the file path and password handy.
+    - **DIAN habilitación credentials** — provided by DIAN when you register your billing software:
+      - `TestSetId` — identifies your test set during habilitación.
+      - `SoftwareID` — the UUID of your registered billing software.
+      - `SoftwarePIN` — the PIN associated with your software registration.
+  </Step>
+
+  <Step title="Clone and install">
+    Clone the repository and install all dependencies in one command. `uv sync` reads `pyproject.toml`, creates an isolated virtual environment, and installs every dependency — no manual `pip install` needed.
+
+    ```bash
+    git clone https://github.com/farojas85/fast-rest-api.git
+    cd fast-rest-api
+    uv sync
+    ```
+
+    To also install the development dependencies (pytest, ruff):
+
+    ```bash
+    uv sync --group dev
     ```
   </Step>
-  <Step title="Configure">
-    Describe any setup or configuration needed before first use.
+
+  <Step title="Configure environment">
+    Copy the provided example file to create your local `.env`:
 
     ```bash
-    your-cli init
+    cp .env.example .env
     ```
+
+    Open `.env` and fill in your real values. The file contains the following variables:
+
+    ```env
+    DIAN_CERT_PATH=/ruta/absoluta/al/certificado.pfx
+    DIAN_CERT_PASSWORD=password_segura
+    DIAN_TEST_SET_ID=xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
+    DIAN_SOFTWARE_ID=xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
+    DIAN_SOFTWARE_PIN=12345
+    ENVIRONMENT=local
+    DIAN_WSDL_URL_HABILITACION=https://vpfe-hab.dian.gov.co/WcfDianCustomerServices.mac/WcfDianCustomerServices.svc?wsdl
+    DIAN_WSDL_URL_PRODUCCION=https://vpfe.dian.gov.co/WcfDianCustomerServices.mac/WcfDianCustomerServices.svc?wsdl
+    ```
+
+    | Variable | Description |
+    |---|---|
+    | `DIAN_CERT_PATH` | Absolute path to your `.pfx` certificate file on disk. |
+    | `DIAN_CERT_PASSWORD` | Password for the `.pfx` certificate. Stored as a `SecretStr` — never logged. |
+    | `DIAN_TEST_SET_ID` | Test Set ID provided by DIAN during the habilitación process. |
+    | `DIAN_SOFTWARE_ID` | UUID of your billing software registered with DIAN. |
+    | `DIAN_SOFTWARE_PIN` | PIN for your registered DIAN software. |
+    | `ENVIRONMENT` | Runtime environment. Any value other than `production` routes requests to the habilitación WSDL. |
+    | `DIAN_WSDL_URL_HABILITACION` | WSDL endpoint for DIAN's testing service. |
+    | `DIAN_WSDL_URL_PRODUCCION` | WSDL endpoint for DIAN's live production service. |
   </Step>
-  <Step title="Run it">
-    Show the first thing a user does to see it working.
+
+  <Step title="Start the server">
+    Start the FastAPI development server with hot-reload enabled:
 
     ```bash
-    your-cli start
+    uvicorn src.main:app --reload
     ```
+
+    On startup, Pydantic Settings loads every variable from `.env` and immediately attempts to open and decrypt your PFX certificate. If the file is missing, unreadable, or the password is wrong, the process exits with an error before accepting any requests — this **fast-fail** behavior prevents the server from running in a broken state.
+
+    Once the server is up, verify it is healthy:
+
+    ```bash
+    curl http://localhost:8000/health
+    ```
+
+    Expected response:
+
+    ```json
+    {
+      "status": "ok",
+      "message": "API is running 🚀"
+    }
+    ```
+
+    <Tip>
+      The interactive Swagger UI is available at [http://localhost:8000/docs](http://localhost:8000/docs) as soon as the server starts. You can explore all endpoints, view request/response schemas, and send test requests directly from your browser — no extra tooling required.
+    </Tip>
+  </Step>
+
+  <Step title="Send your first invoice">
+    Submit a local consumption order (consumo local) to the invoicing endpoint. The example below uses the same payload values as the project's test suite:
+
+    ```bash
+    curl -X POST http://localhost:8000/api/v1/pedidos/consumo-local/ \
+      -H "Content-Type: application/json" \
+      -d '{
+        "id_pedido_origen": "POS-100",
+        "items": [
+          {
+            "id_producto": "B-01",
+            "descripcion": "Cerveza Artesanal",
+            "cantidad": 2,
+            "precio_unitario": 10000.00,
+            "impuestos": [
+              {
+                "nombre": "INC",
+                "tasa": 0.08,
+                "monto": 1600.00
+              }
+            ],
+            "total_item": 21600.00
+          }
+        ],
+        "subtotal": 20000.00,
+        "propina_voluntaria": 3000.00,
+        "impuestos_totales": 1600.00,
+        "total_factura": 24600.00,
+        "metodos_pago": [
+          {
+            "tipo": "Efectivo",
+            "monto": 24600.00
+          }
+        ]
+      }'
+    ```
+
+    On success, the API returns HTTP `201 Created` with a DIAN tracking response:
+
+    ```json
+    {
+      "track_id": "ABC-123",
+      "cufe": null,
+      "status": "SUCCESS",
+      "message": "Factura enviada correctamente a la DIAN"
+    }
+    ```
+
+    Use the `track_id` value to query DIAN's portal and confirm the document was received and accepted.
+
+    <Warning>
+      `ENVIRONMENT=local` routes all requests to the DIAN **habilitación** (testing) WSDL. This environment is safe for development and testing. **Never set `ENVIRONMENT=production` unless you have completed DIAN's official production enablement process** (*habilitación en producción*) and are ready to emit legally binding fiscal documents.
+    </Warning>
   </Step>
 </Steps>
-
-<Tip>
-  Give people a way to get help. This could be a link to a support page, a chat with a customer support agent, or a forum for your product.
-
-  Example: Need help? Reach out to us at [support@yourcompany.com](mailto:support@yourcompany.com).
-</Tip>

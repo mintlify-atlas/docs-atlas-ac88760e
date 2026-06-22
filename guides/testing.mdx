@@ -1,0 +1,277 @@
+---
+title: "Testing DIAN REST API: Unit Tests and Mock Strategies"
+sidebarTitle: "Testing"
+description: "How to run the test suite for DIAN REST API, write unit tests for use cases with mock ports, and test the SOAP adapter in isolation."
+---
+
+The Hexagonal (Ports and Adapters) architecture makes DIAN REST API highly testable at every layer. Use cases can be exercised with zero network calls by injecting lightweight mock implementations of `IDianSoapPort` and `IInvoiceLogRepositoryPort` directly into the use case constructor. The infrastructure adapter itself is tested by mocking zeep's `AsyncClient` at the module level with `unittest.mock.patch`, verifying that the adapter correctly maps responses and exceptions into the expected dictionary format.
+
+## Running the Tests
+
+The project uses [uv](https://docs.astral.sh/uv/) for dependency management. Dev dependencies (including pytest) are in the `dev` group and are not installed in production images.
+
+```bash
+# Install all dependencies including the dev group
+uv sync --group dev
+
+# Run the full test suite
+uv run pytest
+
+# Run with verbose output (shows each test name and status)
+uv run pytest -v
+
+# Run a single test file
+uv run pytest tests/application/use_cases/test_facturar_pedido_local.py -v
+
+# Run a single named test
+uv run pytest tests/infrastructure/adapters/test_dian_adapter.py::test_send_invoice_success -v
+```
+
+<Tip>
+  `pytest-asyncio` is required to run async test functions. Every `async def test_*` function must be decorated with `@pytest.mark.asyncio` — without it, pytest will collect the coroutine but never await it, causing the test to pass vacuously without executing any assertions.
+</Tip>
+
+## Testing Use Cases with Mock Ports
+
+`tests/application/use_cases/test_facturar_pedido_local.py` demonstrates the canonical pattern for testing a use case: define in-process mock adapters, build a realistic fixture, then exercise success and failure paths.
+
+### Mock adapters
+
+```python
+class MockDianPort:
+    async def send_invoice(self, invoice_data: dict) -> dict:
+        return {"track_id": "ABC-123", "status": "SUCCESS", "message": "OK"}
+
+    async def send_credit_note(self, note_data: dict) -> dict:
+        pass
+
+
+class MockLogRepositoryPort:
+    def __init__(self):
+        self.logs = []
+        self.counter = 1
+
+    async def save_log(
+        self, status: str, payload_in: dict, response_out: dict = None
+    ) -> int:
+        self.logs.append({
+            "id": self.counter,
+            "status": status,
+            "payload_in": payload_in,
+            "response_out": response_out
+        })
+        self.counter += 1
+        return self.counter - 1
+```
+
+`MockLogRepositoryPort` stores every call in `self.logs`, letting tests assert not just the final return value but also the number of log writes and the exact status values passed at each stage.
+
+### The valid_payload fixture
+
+The fixture uses real domain schema classes to produce a valid POS order for a Cerveza Artesanal line item — the same example used during manual QA:
+
+```python
+from decimal import Decimal
+from src.infrastructure.controllers.schemas.pedido_local_schema import (
+    PedidoLocalCreateRequest,
+    ItemPedidoRequest,
+    ImpuestoRequest,
+    PagoRequest,
+)
+
+@pytest.fixture
+def valid_payload():
+    return PedidoLocalCreateRequest(
+        id_pedido_origen="POS-100",
+        items=[
+            ItemPedidoRequest(
+                id_producto="B-01",
+                descripcion="Cerveza Artesanal",
+                cantidad=2,
+                precio_unitario=Decimal("10000.00"),
+                impuestos=[
+                    ImpuestoRequest(
+                        nombre="INC",
+                        tasa=Decimal("0.08"),
+                        monto=Decimal("1600.00")
+                    )
+                ],
+                total_item=Decimal("21600.00"),
+            )
+        ],
+        subtotal=Decimal("20000.00"),
+        propina_voluntaria=Decimal("3000.00"),
+        impuestos_totales=Decimal("1600.00"),
+        total_factura=Decimal("24600.00"),
+        metodos_pago=[PagoRequest(tipo="Efectivo", monto=Decimal("24600.00"))]
+    )
+```
+
+### Success path test
+
+```python
+@pytest.mark.asyncio
+async def test_facturar_pedido_local_success(
+    mock_dian_port, mock_log_repository, valid_payload
+):
+    use_case = FacturarPedidoLocalUseCase(mock_dian_port, mock_log_repository)
+
+    response = await use_case.execute(valid_payload)
+
+    assert response.track_id == "ABC-123"
+    assert response.status == "SUCCESS"
+    assert len(mock_log_repository.logs) == 2  # 1 for PROCESANDO, 1 for SUCCESS
+```
+
+The assertion `len(mock_log_repository.logs) == 2` is important: it verifies that the use case records an initial `PROCESANDO` entry before calling the DIAN, and a `SUCCESS` entry after receiving the response. A count of `1` would mean the pre-flight log was skipped; a count of `0` would mean logging is broken entirely.
+
+### Invalid totals test
+
+```python
+@pytest.mark.asyncio
+async def test_facturar_pedido_local_invalid_totals(
+    mock_dian_port, mock_log_repository, valid_payload
+):
+    invalid_payload = valid_payload.model_copy()
+    invalid_payload.total_factura = Decimal("9999.00")  # Deliberately wrong
+
+    use_case = FacturarPedidoLocalUseCase(mock_dian_port, mock_log_repository)
+
+    with pytest.raises(ValueError, match="El total de la factura no coincide"):
+        await use_case.execute(invalid_payload)
+```
+
+This test confirms that the use case validates invoice arithmetic **before** dispatching to the DIAN adapter. No SOAP call is ever made for a structurally invalid invoice, and the `MockDianPort.send_invoice` method is never invoked.
+
+## Testing the DIAN Adapter
+
+`tests/infrastructure/adapters/test_dian_adapter.py` tests `DianSoapAdapter` in isolation by patching `AsyncClient` at module import time, preventing any real WSDL download or HTTP connection during the test run.
+
+### The dian_adapter fixture
+
+```python
+import pytest
+from unittest.mock import AsyncMock, patch
+from src.infrastructure.adapters.dian_soap.dian_adapter import DianSoapAdapter
+
+@pytest.fixture
+def dian_adapter():
+    with patch('src.infrastructure.adapters.dian_soap.dian_adapter.AsyncClient') as MockClient:
+        # Avoid real HTTP calls during initialization
+        adapter = DianSoapAdapter(
+            wsdl_url="http://mock-wsdl",
+            cert_path="/mock/path.pfx",
+            password="mock_password"
+        )
+        return adapter, MockClient
+```
+
+The `patch` target is the fully qualified name of `AsyncClient` **as imported inside the adapter module**, not the zeep package path. This is the standard `unittest.mock` rule: patch where the name is used, not where it is defined.
+
+### Success path test
+
+```python
+@pytest.mark.asyncio
+async def test_send_invoice_success(dian_adapter):
+    adapter, MockClient = dian_adapter
+
+    # Arrange: Mock the zeep client response
+    mock_service = AsyncMock()
+
+    class MockResponse:
+        ZipKey = "TEST-ZIP-KEY-123"
+
+    mock_service.SendTestSetAsync.return_value = MockResponse()
+    adapter.client.service = mock_service
+
+    # Act
+    payload = {"filename": "test.xml", "xml_base64": "YmFzZTY0"}
+    result = await adapter.send_invoice(payload)
+
+    # Assert
+    assert result["success"] is True
+    assert result["track_id"] == "TEST-ZIP-KEY-123"
+    assert result["status"] == "Procesado Correctamente"
+    mock_service.SendTestSetAsync.assert_called_once()
+```
+
+`MockResponse` is a simple class attribute — `ZipKey = "TEST-ZIP-KEY-123"` — that mirrors the real DIAN SOAP response object structure. The adapter reads `ZipKey` via `getattr(response, 'ZipKey', 'mock_track_id')`, so this class satisfies the contract without inheriting from any zeep type.
+
+### Timeout test
+
+```python
+@pytest.mark.asyncio
+async def test_send_invoice_timeout(dian_adapter):
+    adapter, MockClient = dian_adapter
+    import httpx
+
+    # Arrange: Mock timeout exception
+    mock_service = AsyncMock()
+    mock_service.SendTestSetAsync.side_effect = httpx.TimeoutException("Mock Timeout")
+    adapter.client.service = mock_service
+
+    # Act
+    result = await adapter.send_invoice({})
+
+    # Assert
+    assert result["success"] is False
+    assert result["error"] == "Timeout"
+```
+
+Setting `side_effect = httpx.TimeoutException(...)` causes the mock to raise rather than return, exercising the `except httpx.TimeoutException` branch inside `send_invoice`. The test confirms the adapter never re-raises the exception outward and always returns a structured error dictionary.
+
+## Writing New Tests
+
+Use this template when adding tests for a new use case or adapter:
+
+```python
+import pytest
+from decimal import Decimal
+
+
+class MockDianPort:
+    async def send_invoice(self, invoice_data: dict) -> dict:
+        return {"track_id": "MOCK-001", "status": "SUCCESS"}
+
+    async def send_credit_note(self, note_data: dict) -> dict:
+        return {"track_id": "MOCK-CN-001", "status": "SUCCESS"}
+
+
+class MockLogRepo:
+    async def save_log(
+        self, status: str, payload_in: dict, response_out: dict = None
+    ) -> int:
+        return 1
+
+
+@pytest.mark.asyncio
+async def test_my_use_case():
+    use_case = MyUseCase(MockDianPort(), MockLogRepo())
+    result = await use_case.execute(my_payload)
+    assert result.track_id is not None
+```
+
+Key principles to follow:
+- Keep mock adapters in the same test file unless they are reused across many test modules.
+- Use `MockLogRepo` implementations that store calls (like `MockLogRepositoryPort` above) when you need to assert on log counts or log content.
+- Use the real Pydantic schema classes in fixtures — do not build raw dictionaries, since the use case receives typed schema objects.
+- One test file per layer: `tests/application/use_cases/` for business logic, `tests/infrastructure/adapters/` for adapters.
+
+## Dev Dependencies
+
+The following packages from `pyproject.toml` are relevant to testing and code quality:
+
+```toml
+[dependency-groups]
+dev = [
+    "pytest>=9.0.2",
+    "pytest-asyncio>=1.3.0",
+    "ruff>=0.15.4",
+]
+```
+
+| Package | Version | Purpose |
+|---|---|---|
+| `pytest` | `>=9.0.2` | Test runner and fixture engine. |
+| `pytest-asyncio` | `>=1.3.0` | Enables `@pytest.mark.asyncio` so pytest can schedule and await async test coroutines. |
+| `ruff` | `>=0.15.4` | Fast Python linter and formatter. Run before committing with `uv run ruff check .` and auto-fix with `uv run ruff check --fix .`. |

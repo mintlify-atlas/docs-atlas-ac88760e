@@ -1,0 +1,95 @@
+{
+  "projectType": "api-service",
+  "projectName": "DIAN REST API",
+  "projectDescription": "A FastAPI-based REST service for emitting electronic invoices, credit notes, and debit notes to the DIAN (Colombia's tax authority) SOAP web service, with PostgreSQL audit logging.",
+  "theme": "luma",
+  "primaryColor": "#0057A8",
+  "lightColor": "#E8F0FB",
+  "darkColor": "#003C78",
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Documentation",
+        "groups": [
+          {
+            "group": "Get Started",
+            "pages": [
+              "introduction",
+              "quickstart",
+              "configuration"
+            ]
+          },
+          {
+            "group": "Architecture",
+            "pages": [
+              "architecture/overview",
+              "architecture/hexagonal",
+              "architecture/data-flow"
+            ]
+          },
+          {
+            "group": "Guides",
+            "pages": [
+              "guides/pfx-certificate",
+              "guides/dian-soap-integration",
+              "guides/logging",
+              "guides/testing"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "API Reference",
+        "groups": [
+          {
+            "group": "Overview",
+            "pages": [
+              "api-reference/overview",
+              "api-reference/authentication"
+            ]
+          },
+          {
+            "group": "Endpoints",
+            "pages": [
+              "api-reference/health",
+              "api-reference/facturar-pedido-local",
+              "api-reference/nota-credito",
+              "api-reference/pedido-domicilio"
+            ]
+          },
+          {
+            "group": "Schemas",
+            "pages": [
+              "api-reference/schemas/pedido-local",
+              "api-reference/schemas/invoice-response",
+              "api-reference/schemas/error-handling"
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "keyFeatures": [
+    "Electronic invoice emission (Factura Electrónica) to DIAN via SOAP",
+    "Credit note (Nota Crédito) generation referencing original CUFE",
+    "Delivery order (Domicilio) invoicing with separate delivery fee taxation",
+    "PFX digital certificate loading and validation on startup (fast-fail)",
+    "Hexagonal architecture with clean separation of domain, application, and infrastructure",
+    "Async SOAP client using zeep + httpx for non-blocking FastAPI event loop",
+    "PostgreSQL-backed audit logging of all DIAN transaction attempts",
+    "Support for INC (8%), IVA (19%), voluntary tips (non-taxable), and multiple payment methods",
+    "Environment-aware WSDL routing (habilitación vs. producción)"
+  ],
+  "publicApiSurface": [
+    "GET /health — Health check endpoint",
+    "POST /api/v1/pedidos/consumo-local/ — Submit a dine-in order for electronic invoicing",
+    "IDianSoapPort.send_invoice(invoice_data) — Port for sending invoices to DIAN",
+    "IDianSoapPort.send_credit_note(note_data) — Port for sending credit notes to DIAN",
+    "IInvoiceLogRepositoryPort.save_log(status, payload_in, response_out) — Port for persisting transaction logs",
+    "FacturarPedidoLocalUseCase.execute(payload) — Use case for billing a local order",
+    "DianSoapAdapter(wsdl_url, cert_path, password) — Zeep-based SOAP adapter",
+    "Settings — Pydantic settings model (DIAN_CERT_PATH, DIAN_CERT_PASSWORD, DIAN_TEST_SET_ID, DIAN_SOFTWARE_ID, DIAN_SOFTWARE_PIN, ENVIRONMENT, DIAN_WSDL_URL_HABILITACION, DIAN_WSDL_URL_PRODUCCION)",
+    "PedidoLocalCreateRequest — Pydantic request schema for local orders",
+    "PedidoLocalResponse — Pydantic response schema (track_id, cufe, status, message)"
+  ]
+}

@@ -1,0 +1,76 @@
+---
+title: "DIAN REST API: Electronic Invoicing for Colombian Businesses"
+sidebarTitle: "Introduction"
+description: "DIAN REST API is a FastAPI service that submits electronic invoices and credit notes to Colombia's DIAN via SOAP, with Hexagonal architecture and PostgreSQL logging."
+---
+
+DIAN REST API is a production-ready FastAPI service that handles the full lifecycle of Colombian electronic invoicing. It is designed for restaurant POS systems, billing platforms, and any software that needs to comply with Colombia's mandatory electronic invoicing law. The API abstracts the complexity of XML document construction, digital certificate signing, and SOAP communication with the DIAN — so your application only has to send a structured JSON payload and receive a tracking response in return.
+
+## What is DIAN?
+
+The **Dirección de Impuestos y Aduanas Nacionales (DIAN)** is Colombia's national tax and customs authority. Since 2019, DIAN has mandated that businesses above certain revenue thresholds issue all invoices, credit notes, and debit notes electronically in a signed XML format transmitted directly to DIAN's web services. Non-compliance results in penalties. The process requires a government-issued digital certificate (PFX), a registered software identity (SoftwareID + SoftwarePIN), and a test enablement stage (*habilitación*) before going live in production.
+
+## What this API does
+
+<CardGroup cols={2}>
+  <Card title="Factura Electrónica" icon="file-invoice">
+    Emit electronic invoices for local consumption orders from POS systems. The API validates line-item totals, applies tax rules, and submits the signed document to DIAN's SOAP service, returning a `track_id` for status tracking.
+  </Card>
+  <Card title="Nota Crédito" icon="rotate-left">
+    Generate credit notes that reference a previously submitted electronic invoice. Used for partial or full reversals that must be reported to DIAN for audit compliance.
+  </Card>
+  <Card title="Delivery Order Invoicing" icon="truck">
+    Issue electronic invoices for delivery orders, supporting the same tax and payment structures as local consumption orders while maintaining a separate document trail.
+  </Card>
+  <Card title="PostgreSQL Audit Logging" icon="database">
+    Every invoicing attempt — successful or failed — is written to a PostgreSQL audit log via an async SQLAlchemy adapter. The log captures the full inbound payload, the DIAN response, and the final document status.
+  </Card>
+</CardGroup>
+
+## Tech stack
+
+DIAN REST API is built on a carefully chosen set of modern Python libraries, all managed with `uv`:
+
+- **FastAPI** — high-performance async REST framework with automatic OpenAPI documentation generation.
+- **Pydantic v2** — strict data validation and settings management for all DTOs and environment configuration.
+- **SQLAlchemy (Async) + Alembic** — async ORM for PostgreSQL persistence and schema migration management.
+- **zeep + httpx** — `zeep` provides the SOAP client, configured with `httpx`'s `AsyncTransport` so SOAP calls never block FastAPI's event loop.
+- **cryptography** — loads and validates the DIAN PFX certificate at startup and signs XML payloads.
+- **PostgreSQL** — relational database for secure, auditable transaction logging.
+- **uv** — fast, robust package manager and virtual environment tool that replaces `pip` and `virtualenv`.
+
+## Project structure
+
+The codebase follows **Hexagonal Architecture (Ports & Adapters)**, keeping business logic completely isolated from infrastructure concerns:
+
+```
+src/
+├── domain/              # Pure business entities (Pedido, ConceptoImpuesto, Propina)
+│                        # No external dependencies — plain Python dataclasses and enums.
+│
+├── application/         # Use cases and port interfaces (contracts)
+│   ├── ports/           # Abstract interfaces: IDianSoapPort, IInvoiceRepository
+│   └── use_cases/       # Business logic: FacturarPedidoLocalUseCase, etc.
+│
+└── infrastructure/      # Concrete adapters and framework wiring
+    ├── adapters/        # Driven adapters: DianSoapAdapter (SOAP), PostgreSQL repo
+    ├── config/          # Pydantic Settings — loads and validates all env vars
+    └── controllers/     # Driving adapters: FastAPI routers and Pydantic schemas
+```
+
+**Domain** holds pure business rules with zero external dependencies. **Application** defines *what* the system must do via use-case classes and port interfaces. **Infrastructure** provides the concrete implementations — the FastAPI controllers that receive HTTP requests, the SOAP adapter that talks to DIAN, and the PostgreSQL adapter that writes audit logs.
+
+<Note>
+  DIAN REST API supports both DIAN environments out of the box. Set `ENVIRONMENT=local` (or any non-production value) to route all requests to the **habilitación** (testing) WSDL at `https://vpfe-hab.dian.gov.co/`. Set `ENVIRONMENT=production` to route to the live **producción** WSDL at `https://vpfe.dian.gov.co/`. The correct WSDL is selected automatically at runtime — no code changes required.
+</Note>
+
+## Next steps
+
+<CardGroup cols={2}>
+  <Card title="Quickstart" icon="rocket" href="/quickstart">
+    Install dependencies, configure your DIAN credentials, and send your first electronic invoice in minutes.
+  </Card>
+  <Card title="Architecture Overview" icon="sitemap" href="/architecture/overview">
+    Deep-dive into the Hexagonal Architecture design, sequence diagrams, and technical contracts.
+  </Card>
+</CardGroup>

@@ -1,0 +1,181 @@
+---
+title: "Configure the DIAN PFX Digital Certificate for Invoice Signing"
+sidebarTitle: "PFX Certificate"
+description: "How to obtain, place, and configure your DIAN-issued PFX digital signing certificate so DIAN REST API validates it on startup and uses it for SOAP requests."
+---
+
+Every electronic invoice submitted to Colombia's DIAN must be digitally signed using a PFX (PKCS#12) certificate issued through the DIAN habilitación process. DIAN REST API reads this certificate at application startup via the `Settings` class and **refuses to start** if the file cannot be found, decrypted, or parsed. This fast-fail design prevents silent signing failures from reaching production traffic.
+
+## What Is a PFX Certificate?
+
+A `.pfx` file (also called a PKCS#12 archive) bundles three pieces of cryptographic material into a single, password-protected binary file:
+
+- **Private key** — used to create the digital signature on each XML invoice.
+- **Public certificate** — contains the signer's identity and is included in the signed envelope.
+- **Chain certificates** (optional) — intermediate CA certificates that establish trust back to the root.
+
+The DIAN issues these certificates during the **software registration (habilitación)** process. Until your software is registered and approved in the DIAN portal, you receive a testing certificate valid only against the `vpfe-hab` environment.
+
+## Obtaining Your Certificate
+
+<Steps>
+  <Step title="Complete DIAN software registration">
+    Log in to the DIAN portal and complete the **Registro de Software** process for your billing software. You will need your NIT, software name, and technical contact information.
+  </Step>
+  <Step title="Download the .pfx file">
+    After approval, the DIAN portal provides a downloadable `.pfx` file. Store it securely — this file cannot be regenerated without re-registering.
+  </Step>
+  <Step title="Record the certificate password">
+    The portal displays (or emails) a password for the `.pfx` archive. Save this password in your secrets manager immediately; it is required for every application start.
+  </Step>
+</Steps>
+
+## Placing the Certificate
+
+`DIAN_CERT_PATH` must be an **absolute path** on the server where the API process runs. Do not use relative paths; Pydantic's `FilePath` type resolves paths relative to the process working directory, which can differ between deployment environments.
+
+The recommended directory layout keeps certificates isolated under a dedicated system directory:
+
+```bash
+/etc/dian-api/
+└── certificates/
+    └── your-cert.pfx   # 600 permissions, owned by the service user
+```
+
+After placing the file, restrict permissions so only the service account can read it:
+
+```bash
+chmod 600 /etc/dian-api/certificates/your-cert.pfx
+chown dian-api:dian-api /etc/dian-api/certificates/your-cert.pfx
+```
+
+<Warning>
+  Never store the `.pfx` file inside the application source tree or any directory tracked by Git. The private key embedded in the certificate is a tax-authority credential — exposure would allow third parties to sign invoices in your name.
+</Warning>
+
+## Configuring the Environment
+
+Add the following two variables to your `.env` file (or inject them via your secrets manager / container orchestrator):
+
+```env
+DIAN_CERT_PATH=/etc/dian-api/certificates/your-cert.pfx
+DIAN_CERT_PASSWORD=your_secure_password
+```
+
+The full set of DIAN-related variables required by `Settings` is:
+
+```env
+DIAN_CERT_PATH=/etc/dian-api/certificates/your-cert.pfx
+DIAN_CERT_PASSWORD=your_secure_password
+DIAN_TEST_SET_ID=xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
+DIAN_SOFTWARE_ID=xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
+DIAN_SOFTWARE_PIN=12345
+ENVIRONMENT=local
+DIAN_WSDL_URL_HABILITACION=https://vpfe-hab.dian.gov.co/WcfDianCustomerServices.mac/WcfDianCustomerServices.svc?wsdl
+DIAN_WSDL_URL_PRODUCCION=https://vpfe.dian.gov.co/WcfDianCustomerServices.mac/WcfDianCustomerServices.svc?wsdl
+```
+
+<Warning>
+  `DIAN_CERT_PASSWORD` should **never** be committed to version control. Add `.env` to `.gitignore` and use a dedicated secrets manager (AWS Secrets Manager, HashiCorp Vault, Doppler, etc.) in staging and production environments.
+</Warning>
+
+## Startup Validation
+
+`Settings` uses a Pydantic `@model_validator(mode="after")` to verify the certificate immediately when the application process starts. The validator opens the file and passes the raw bytes through `pkcs12.load_key_and_certificates()` from the `cryptography` library. If any step fails the application raises a `ValueError` and exits before accepting any HTTP traffic.
+
+Here is the exact validator from `src/infrastructure/config/settings.py`:
+
+```python
+from pydantic import Field, SecretStr, FilePath, model_validator
+from pydantic_settings import BaseSettings, SettingsConfigDict
+from cryptography.hazmat.primitives.serialization import pkcs12
+
+
+class Settings(BaseSettings):
+    """
+    Application Settings.
+    These settings are loaded from environment variables and validated on startup.
+    Missing variables will cause the application to fail immediately.
+    """
+
+    DIAN_CERT_PATH: FilePath = Field(description="Absolute path to the PFX certificate")
+    DIAN_CERT_PASSWORD: SecretStr = Field(
+        description="Password for the PFX certificate"
+    )
+    DIAN_TEST_SET_ID: str = Field(description="DIAN Test Set ID")
+    DIAN_SOFTWARE_ID: str = Field(description="DIAN Software ID")
+    DIAN_SOFTWARE_PIN: str = Field(description="DIAN Software PIN")
+    ENVIRONMENT: str = Field(
+        default="local", description="Environment (local, staging, production)"
+    )
+    DIAN_WSDL_URL_HABILITACION: str = Field(
+        description="WSDL URL for the DIAN SOAP testing service"
+    )
+    DIAN_WSDL_URL_PRODUCCION: str = Field(
+        description="WSDL URL for the DIAN SOAP production service"
+    )
+
+    @model_validator(mode="after")
+    def validate_pfx_certificate(self) -> "Settings":
+        """
+        Validates that the provided PFX file can be read with the configured password.
+        This ensures a fast-fail before the application starts if the cert is invalid.
+        """
+        pfx_path = self.DIAN_CERT_PATH
+        password = self.DIAN_CERT_PASSWORD.get_secret_value()
+
+        try:
+            with open(pfx_path, "rb") as cert_file:
+                pfx_data = cert_file.read()
+            # Try to load the key and certs; if the password or format is wrong, this raises
+            pkcs12.load_key_and_certificates(
+                pfx_data,
+                password.encode("utf-8") if password else None,
+            )
+        except Exception as e:
+            raise ValueError(
+                f"Failed to load the PFX certificate at {pfx_path}. "
+                f"Ensure the path is correct, the file is a valid PFX, and the password is correct. "
+                f"Error: {e}"
+            )
+
+        return self
+
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
+```
+
+Two details worth noting:
+
+- `DIAN_CERT_PASSWORD` is declared as `SecretStr`, so Pydantic never prints its value in logs or tracebacks. The validator calls `.get_secret_value()` only at the point of use.
+- `DIAN_CERT_PATH` is declared as `FilePath`, which means Pydantic itself validates that the path exists **before** the model validator even runs. If the file is missing you receive a `ValidationError` from Pydantic, not a `ValueError` from the validator.
+
+## Common Certificate Errors
+
+<AccordionGroup>
+  <Accordion title="ValidationError: DIAN_CERT_PATH is not a valid path">
+    Pydantic's `FilePath` type requires the file to exist on disk at the moment `Settings()` is instantiated. This error fires before the PFX validator runs.
+
+    **Fix:** Confirm the absolute path is correct and that the file exists at that exact location. Check for typos, trailing spaces, or environment variable interpolation issues. Run `ls -la /etc/dian-api/certificates/` to verify.
+  </Accordion>
+  <Accordion title="ValueError: Failed to load the PFX certificate">
+    The file exists and is readable, but `pkcs12.load_key_and_certificates()` raised an exception. The three most common causes are:
+
+    1. **Wrong password** — double-check `DIAN_CERT_PASSWORD`. Passwords are case-sensitive and may contain special characters that need escaping in `.env` files (wrap the value in double quotes if it contains `#`, `=`, or spaces).
+    2. **Corrupted file** — re-download the `.pfx` from the DIAN portal and replace the existing file.
+    3. **Wrong file format** — the file must be a PKCS#12 archive (`.pfx` or `.p12`). A PEM-encoded `.crt` or `.pem` file will not work.
+  </Accordion>
+  <Accordion title="FileNotFoundError during startup (OS-level)">
+    If the process user does not have read permission on the `.pfx` file, the `open()` call inside the validator raises `FileNotFoundError` or `PermissionError`, which is then wrapped in the `ValueError`.
+
+    **Fix:** Ensure the file has at least `600` permissions and is owned by the user that runs the API process:
+
+    ```bash
+    chmod 600 /etc/dian-api/certificates/your-cert.pfx
+    chown dian-api:dian-api /etc/dian-api/certificates/your-cert.pfx
+    ```
+  </Accordion>
+</AccordionGroup>

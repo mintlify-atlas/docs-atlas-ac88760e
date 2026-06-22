@@ -1,0 +1,238 @@
+---
+title: "Integrate with the DIAN SOAP Web Service for Electronic Invoicing"
+sidebarTitle: "DIAN SOAP Integration"
+description: "How DianSoapAdapter uses zeep with async httpx transport to call DIAN web services, handle WSDL environments, and manage SOAP errors."
+---
+
+DIAN REST API communicates with Colombia's tax authority through a WCF/SOAP web service. The `DianSoapAdapter` class, located at `src/infrastructure/adapters/dian_soap/dian_adapter.py`, implements the `IDianSoapPort` interface using `zeep.AsyncClient` over an `httpx.AsyncTransport`. This combination gives you fully non-blocking SOAP calls inside FastAPI's async event loop without spawning threads.
+
+## DIAN Web Service Environments
+
+The DIAN operates two independent SOAP endpoints. The active endpoint is selected automatically at runtime based on the `ENVIRONMENT` variable: any value other than `"production"` routes traffic to the habilitación (testing) environment.
+
+<CardGroup cols={2}>
+  <Card title="Habilitación (Testing)" icon="flask">
+    Used when `ENVIRONMENT != 'production'`.
+
+    ```
+    https://vpfe-hab.dian.gov.co/WcfDianCustomerServices.mac/
+    WcfDianCustomerServices.svc?wsdl
+    ```
+
+    Accepts test invoices using `DIAN_TEST_SET_ID`. No fiscal effects.
+  </Card>
+  <Card title="Producción" icon="building-columns">
+    Used when `ENVIRONMENT == 'production'`.
+
+    ```
+    https://vpfe.dian.gov.co/WcfDianCustomerServices.mac/
+    WcfDianCustomerServices.svc?wsdl
+    ```
+
+    Every document submitted has real legal and fiscal consequences.
+  </Card>
+</CardGroup>
+
+The WSDL URL is resolved inside `get_dian_adapter()` in `pedido_local_controller.py`:
+
+```python
+wsdl = (
+    settings.DIAN_WSDL_URL_HABILITACION
+    if settings.ENVIRONMENT != "production"
+    else settings.DIAN_WSDL_URL_PRODUCCION
+)
+```
+
+<Warning>
+  Never call the **production** WSDL with test credentials, a test `testSetId`, or synthetic invoice data. The DIAN records every document submitted to `vpfe.dian.gov.co` as a legal fiscal event. Mistakes cannot easily be reversed and may require formal correction procedures with your tax advisor.
+</Warning>
+
+## The DianSoapAdapter
+
+`DianSoapAdapter` is constructed with three arguments — `wsdl_url`, `cert_path`, and `password` — and initializes the full zeep async stack during `__init__`. Here is the complete class from source:
+
+```python
+import httpx
+from typing import Dict, Any
+from zeep import AsyncClient
+from zeep.transports import AsyncTransport
+from zeep.plugins import HistoryPlugin
+
+from src.application.ports.dian_port import IDianSoapPort
+
+
+class DianSoapAdapter(IDianSoapPort):
+    """
+    Implementación del puerto IDianSoapPort usando la librería `zeep` con transporte asíncrono.
+    """
+    def __init__(self, wsdl_url: str, cert_path: str, password: str):
+        self.wsdl_url = wsdl_url
+        self.cert_path = cert_path
+        self.password = password
+
+        # httpx Async Client
+        self.httpx_client = httpx.AsyncClient(timeout=30.0)
+        self.transport = AsyncTransport(client=self.httpx_client)
+
+        # Plugins para WS-Addressing (requerido por DIAN) y debug
+        self.history = HistoryPlugin()
+
+        # Inicialización del cliente SOAP Asíncrono de Zeep
+        self.client = AsyncClient(
+            wsdl=self.wsdl_url,
+            transport=self.transport,
+            plugins=[self.history]
+        )
+
+    async def send_invoice(self, invoice_data: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Envía una factura electrónica a la DIAN de forma asíncrona.
+        """
+        try:
+            response = await self.client.service.SendTestSetAsync(
+                fileName=invoice_data.get("filename", "factura.xml"),
+                contentFile=invoice_data.get("xml_base64", ""),
+                testSetId=invoice_data.get("test_set_id", "")
+            )
+
+            return {
+                "success": True,
+                "track_id": getattr(response, 'ZipKey', 'mock_track_id'),
+                "cufe": "VALID_CUFE_MOCK",
+                "status": "Procesado Correctamente",
+                "raw_response": str(response)
+            }
+
+        except httpx.TimeoutException:
+            return {
+                "success": False,
+                "error": "Timeout",
+                "message": "La DIAN tardó demasiado en responder."
+            }
+        except Exception as e:
+            return {
+                "success": False,
+                "error": type(e).__name__,
+                "message": str(e)
+            }
+
+    async def send_credit_note(self, note_data: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Envía una nota crédito a la DIAN.
+        """
+        return {
+            "success": False,
+            "message": "Not implemented yet"
+        }
+```
+
+### Key constructor details
+
+| Component | Purpose |
+|---|---|
+| `httpx.AsyncClient(timeout=30.0)` | Creates a shared async HTTP client with a 30-second total timeout. Prevents a slow or unresponsive DIAN endpoint from blocking the event loop indefinitely. |
+| `AsyncTransport(client=self.httpx_client)` | Tells zeep to route all SOAP HTTP traffic through the httpx client instead of the default synchronous `requests` library, keeping all I/O non-blocking. |
+| `HistoryPlugin()` | Captures the raw SOAP XML envelopes (request and response) in `self.history.last_sent` and `self.history.last_received`. Invaluable for diagnosing DIAN validation errors. |
+| `AsyncClient(wsdl=..., transport=..., plugins=[...])` | Initializes the zeep client, downloads the WSDL (or reads it from cache), and builds Python bindings for every SOAP operation defined by the DIAN service. |
+
+## SOAP Method: SendTestSetAsync
+
+The adapter calls `self.client.service.SendTestSetAsync(...)`, which maps to the DIAN WSDL operation of the same name. Zeep serializes the Python keyword arguments into a SOAP envelope automatically.
+
+The three parameters zeep sends to the DIAN service are:
+
+| Parameter | Source | Description |
+|---|---|---|
+| `fileName` | `invoice_data["filename"]` | The logical file name of the XML invoice (e.g. `"factura.xml"`). The DIAN uses this for internal tracking. |
+| `contentFile` | `invoice_data["xml_base64"]` | The complete signed XML invoice, **base64-encoded**. The DIAN decodes and validates it server-side. |
+| `testSetId` | `invoice_data["test_set_id"]` | The `DIAN_TEST_SET_ID` UUID from your environment, issued during the habilitación registration. Required in the testing environment. |
+
+The DIAN service responds with an object whose `ZipKey` attribute becomes the `track_id` returned to the API caller:
+
+```python
+"track_id": getattr(response, 'ZipKey', 'mock_track_id'),
+```
+
+`track_id` can be used in subsequent DIAN queries to retrieve the final validation status and the official CUFE (Código Único de Factura Electrónica).
+
+## Error Handling
+
+The adapter converts all infrastructure-level exceptions into structured Python dictionaries so the application layer never receives raw SOAP or HTTP exceptions:
+
+<AccordionGroup>
+  <Accordion title="httpx.TimeoutException → Timeout error dict">
+    Raised when the DIAN server does not respond within the 30-second window configured on the `httpx.AsyncClient`. The adapter returns:
+
+    ```python
+    {
+        "success": False,
+        "error": "Timeout",
+        "message": "La DIAN tardó demasiado en responder."
+    }
+    ```
+
+    This allows the use case layer to log the failure and return an appropriate HTTP 500 to the client without crashing.
+  </Accordion>
+  <Accordion title="Generic Exception → named error dict">
+    Any other exception (zeep `Fault`, network error, XML parse failure, etc.) is caught by the broad `except Exception as e` handler and returned as:
+
+    ```python
+    {
+        "success": False,
+        "error": type(e).__name__,   # e.g. "Fault", "TransportError"
+        "message": str(e)
+    }
+    ```
+
+    The `error` field carries the exception class name so callers can distinguish SOAP faults from network errors without parsing the message string.
+  </Accordion>
+</AccordionGroup>
+
+## The IDianSoapPort Interface
+
+`DianSoapAdapter` satisfies the `IDianSoapPort` Protocol defined in `src/application/ports/dian_port.py`:
+
+```python
+from typing import Protocol, Any, Dict
+
+class IDianSoapPort(Protocol):
+    """
+    Puerto (Interfaz) de salida para la comunicación con la DIAN.
+    La implementación (Zeep o HTTPX) reside en infraestructura.
+    """
+    async def send_invoice(self, invoice_data: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Envía una factura electrónica a la DIAN.
+        """
+        ...
+
+    async def send_credit_note(self, note_data: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Envía una nota crédito a la DIAN.
+        """
+        ...
+```
+
+Because `IDianSoapPort` is a structural `Protocol`, the application layer (`FacturarPedidoLocalUseCase`) depends only on this interface — not on `DianSoapAdapter` directly. This means:
+
+- **Tests** can pass a lightweight `MockDianPort` with zero network calls.
+- **Alternative adapters** (e.g., a direct HTTPS adapter without zeep) can be swapped in by satisfying the same two-method contract.
+- **The domain and application layers remain completely decoupled** from zeep, httpx, and SOAP concepts.
+
+## Credit Note Support
+
+The `send_credit_note` method currently returns a stub response and has not yet been connected to the DIAN SOAP service:
+
+```python
+async def send_credit_note(self, note_data: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "success": False,
+        "message": "Not implemented yet"
+    }
+```
+
+It follows the same `IDianSoapPort` interface and will eventually call the appropriate DIAN WSDL operation for credit notes (notas crédito). The interface contract is already in place, so adding the implementation will not require changes to the application or domain layers.
+
+<Note>
+  **A note on X.509 XML signing in production:** The DIAN's production service (`vpfe.dian.gov.co`) requires that the XML invoice be digitally signed with an X.509 signature before submission — the SOAP envelope itself must carry a `WS-Security` header containing the signature produced by the private key inside the PFX certificate. The current adapter abstracts this step. A full production implementation would extract the private key from the PFX at startup and pass it to `zeep.wsse.Signature(key_file, certfile)` (or a custom `signxml`-based plugin) so zeep adds the correct `<wsse:Security>` header to every outbound envelope automatically.
+</Note>

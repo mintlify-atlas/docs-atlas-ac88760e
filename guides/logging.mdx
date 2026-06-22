@@ -1,0 +1,177 @@
+---
+title: "Audit Logging for DIAN Invoice Transactions in PostgreSQL"
+sidebarTitle: "Transaction Logging"
+description: "How DIAN REST API logs every invoice attempt, DIAN SOAP response, and error to PostgreSQL for traceability, audits, and support diagnostics."
+---
+
+Every invoice request handled by DIAN REST API — regardless of whether the DIAN accepts, rejects, or times out on the submission — is recorded in PostgreSQL. This audit trail is a legal and operational necessity: Colombian e-invoicing regulations require issuers to demonstrate the full lifecycle of every electronic document, and support teams need structured logs to diagnose failures without re-submitting invoices. The logging architecture is defined as a port interface so that the PostgreSQL adapter can be implemented and injected independently of the business logic.
+
+## The IInvoiceLogRepositoryPort Interface
+
+The contract for all log operations lives in `src/application/ports/log_repository.py`:
+
+```python
+from typing import Protocol, Dict, Any
+
+class IInvoiceLogRepositoryPort(Protocol):
+    """
+    Puerto (Interfaz) para el guardado de los logs de transacciones de facturación.
+    La implementación (SQLAlchemy) reside en infraestructura.
+    """
+    async def save_log(
+        self,
+        status: str,
+        payload_in: Dict[str, Any],
+        response_out: Dict[str, Any] = None
+    ) -> int:
+        """
+        Guarda un nuevo registro o actualiza el estado de la transacción.
+        """
+        ...
+```
+
+The single `save_log` method is intentionally generic. Every lifecycle transition — initial recording, success update, and failure recording — flows through the same signature:
+
+| Parameter | Type | Description |
+|---|---|---|
+| `status` | `str` | Lifecycle state of the transaction: `"PROCESANDO"`, `"SUCCESS"`, or `"FAILED"`. |
+| `payload_in` | `Dict[str, Any]` | The complete incoming request payload from the POS or client, serialized as a dictionary. |
+| `response_out` | `Dict[str, Any]` | The DIAN response dictionary on success, or an error dictionary on failure. Defaults to `None` for the initial `PROCESANDO` entry. |
+| **return value** | `int` | The auto-assigned primary key (`id`) of the persisted log record, useful for correlating subsequent status updates. |
+
+## Log Lifecycle in a Request
+
+Each invoice submission results in exactly two `save_log` calls under normal conditions: one before the DIAN call and one after.
+
+<Steps>
+  <Step title="Record PROCESANDO before the DIAN call">
+    Before the adapter dispatches the SOAP request, the use case calls:
+
+    ```python
+    log_id = await self.log_repo.save_log(
+        status="PROCESANDO",
+        payload_in=payload.model_dump()
+    )
+    ```
+
+    This creates a durable record of the intent to submit. If the process crashes mid-flight, the `PROCESANDO` row with no matching `SUCCESS` or `FAILED` sibling signals an incomplete submission that requires investigation.
+  </Step>
+  <Step title="Record SUCCESS after a valid DIAN response">
+    When `DianSoapAdapter.send_invoice()` returns `{"success": True, ...}`, the use case records the outcome including the DIAN-assigned `track_id`, the CUFE, and the processing status:
+
+    ```python
+    await self.log_repo.save_log(
+        status="SUCCESS",
+        payload_in=payload.model_dump(),
+        response_out={
+            "track_id": dian_response["track_id"],
+            "cufe": dian_response["cufe"],
+            "status": dian_response["status"]
+        }
+    )
+    ```
+  </Step>
+  <Step title="Record FAILED on any exception or DIAN rejection">
+    If the adapter returns `{"success": False, ...}` or the use case raises an unhandled exception, the failure is logged before propagating:
+
+    ```python
+    await self.log_repo.save_log(
+        status="FAILED",
+        payload_in=payload.model_dump(),
+        response_out={"error": str(e)}
+    )
+    ```
+
+    The `response_out` field captures the error type and message so support staff can distinguish a DIAN SOAP `Fault` from a local validation `ValueError` or a network `Timeout`.
+  </Step>
+</Steps>
+
+## PostgreSQL Schema (Planned)
+
+The full SQLAlchemy model and Alembic migration script are the next implementation milestone. Based on the `IInvoiceLogRepositoryPort` interface, the target table structure is:
+
+| Column | Type | Notes |
+|---|---|---|
+| `id` | `SERIAL PRIMARY KEY` | Auto-increment primary key returned by `save_log`. |
+| `status` | `VARCHAR(20)` | One of `PROCESANDO`, `SUCCESS`, or `FAILED`. Consider a PostgreSQL `ENUM` type for constraint enforcement. |
+| `payload_in` | `JSONB` | Full invoice request dictionary. `JSONB` enables indexed queries on individual fields (e.g., `payload_in->>'id_pedido_origen'`). |
+| `response_out` | `JSONB` | DIAN response or error dictionary. Nullable for `PROCESANDO` entries. |
+| `created_at` | `TIMESTAMPTZ` | UTC timestamp set automatically on insert via `DEFAULT now()`. |
+
+<Note>
+  Alembic is already configured in the project (`alembic.ini` is present and `alembic` is listed as a production dependency in `pyproject.toml`). Once the SQLAlchemy `InvoiceLog` model is defined, generating the migration is a single command: `uv run alembic revision --autogenerate -m "add invoice_log table"`.
+</Note>
+
+## Current Development State
+
+While the PostgreSQL adapter is pending, the controller injects a `MockLogRepo` placeholder that satisfies the interface structurally but silently discards all log data. You can see this in `src/infrastructure/controllers/pedido_local_controller.py`:
+
+```python
+def get_use_case(
+    dian_adapter: DianSoapAdapter = Depends(get_dian_adapter)
+) -> FacturarPedidoLocalUseCase:
+    """
+    Inyecta las dependencias al caso de uso.
+    Queda pendiente Mock de InvoiceLogRepositoryPort hasta el siguiente Issue de BD.
+    """
+    class MockLogRepo:
+        async def log_attempt(self, **kwargs): pass
+        async def update_status(self, **kwargs): pass
+
+    return FacturarPedidoLocalUseCase(
+        dian_port=dian_adapter,
+        log_repo=MockLogRepo()
+    )
+```
+
+`MockLogRepo` accepts all calls without raising errors, which keeps the application functional during development. No data is persisted. **Do not deploy this to a production environment** — every invoice submission will be untracked and unrecoverable from the application's own records.
+
+## Implementing Your Own Log Adapter
+
+To replace `MockLogRepo` with a real PostgreSQL adapter, create a class that implements `IInvoiceLogRepositoryPort` using SQLAlchemy's async session:
+
+```python
+from sqlalchemy.ext.asyncio import AsyncSession
+from src.application.ports.log_repository import IInvoiceLogRepositoryPort
+from src.infrastructure.database.models import InvoiceLog  # your SQLAlchemy model
+
+
+class PostgresInvoiceLogRepository:
+    def __init__(self, session: AsyncSession):
+        self.session = session
+
+    async def save_log(
+        self,
+        status: str,
+        payload_in: dict,
+        response_out: dict = None
+    ) -> int:
+        log = InvoiceLog(
+            status=status,
+            payload_in=payload_in,
+            response_out=response_out
+        )
+        self.session.add(log)
+        await self.session.commit()
+        await self.session.refresh(log)
+        return log.id
+```
+
+Then inject it into the use case via FastAPI's dependency injection system, replacing the `MockLogRepo` block in `get_use_case()`:
+
+```python
+from src.infrastructure.database.session import get_async_session
+from src.infrastructure.adapters.log.postgres_log_repository import PostgresInvoiceLogRepository
+
+def get_use_case(
+    dian_adapter: DianSoapAdapter = Depends(get_dian_adapter),
+    session: AsyncSession = Depends(get_async_session)
+) -> FacturarPedidoLocalUseCase:
+    log_repo = PostgresInvoiceLogRepository(session)
+    return FacturarPedidoLocalUseCase(
+        dian_port=dian_adapter,
+        log_repo=log_repo
+    )
+```
+
+Because `IInvoiceLogRepositoryPort` is a structural `Protocol`, Python's duck typing will verify compatibility at runtime — no explicit inheritance from the Protocol is required.

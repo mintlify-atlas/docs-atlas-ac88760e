@@ -1,0 +1,63 @@
+---
+title: "DIAN REST API System Architecture Overview"
+sidebarTitle: "Overview"
+description: "How DIAN REST API is structured: FastAPI controllers, Hexagonal use cases, domain entities, SOAP adapter, and PostgreSQL logging layer."
+---
+
+DIAN REST API is built on **Hexagonal Architecture (Ports & Adapters)**, a design philosophy that enforces strict layer separation between business logic and infrastructure concerns. The domain — tax calculations, tip handling, invoice totals, and buyer identity — lives in pure Python entities with zero external dependencies. An application layer of use cases and port interfaces sits above the domain, defining the *contracts* that infrastructure must fulfill. FastAPI controllers, the zeep SOAP client, and the PostgreSQL audit logger are all interchangeable adapters that plug in at the edges. Every layer is async-first: FastAPI's async route handlers, zeep's `AsyncTransport` backed by `httpx`, and SQLAlchemy's async engine ensure no thread is ever blocked waiting on I/O. This architecture makes each concern independently testable, replaceable, and auditable.
+
+## Tech Stack
+
+| Component | Role |
+|---|---|
+| **FastAPI** (Python 3.10+) | Primary REST framework — high-performance ASGI, auto OpenAPI docs, async route handlers |
+| **Pydantic v2** | DTO validation for all incoming HTTP payloads and outgoing response models |
+| **SQLAlchemy Async + Alembic** | Async ORM for PostgreSQL access; Alembic manages schema migrations |
+| **zeep + httpx AsyncTransport** | Async SOAP client for communicating with DIAN web services without blocking the event loop |
+| **PostgreSQL** | Relational storage for the full audit log of every invoice attempt and its DIAN response |
+| **cryptography** | Loads PFX certificates at startup via `pkcs12.load_key_and_certificates` — fails fast if the cert or password is invalid |
+| **uv** | Fast dependency management and virtual environment tooling (replaces pip/virtualenv) |
+| **ruff** | Linting and code formatting enforced across the entire codebase |
+
+## Directory Structure
+
+```text
+src/
+├── main.py                          # FastAPI app factory, router registration
+├── domain/
+│   └── entities/
+│       └── pedido_local.py          # Pure domain entities (no external deps)
+├── application/
+│   ├── ports/
+│   │   ├── dian_port.py             # IDianSoapPort interface
+│   │   └── log_repository.py       # IInvoiceLogRepositoryPort interface
+│   └── use_cases/
+│       └── facturar_pedido_local.py # FacturarPedidoLocalUseCase
+└── infrastructure/
+    ├── adapters/
+    │   └── dian_soap/
+    │       └── dian_adapter.py     # DianSoapAdapter (zeep)
+    ├── config/
+    │   └── settings.py             # Pydantic Settings
+    └── controllers/
+        ├── pedido_local_controller.py
+        └── schemas/
+            ├── pedido_local_schema.py
+            └── invoice_schema.py
+```
+
+## Three Layers at a Glance
+
+<CardGroup cols={3}>
+  <Card title="Domain" icon="gem">
+    Pure Pydantic entities (`PedidoLocal`, `ItemPedido`, `ConceptoImpuesto`, `MetodoPago`, `Adquirente`) that represent the billing domain with no imports from infrastructure or application layers. This is the innermost layer — the business rules live here.
+  </Card>
+  <Card title="Application" icon="arrows-spin">
+    Use cases (`FacturarPedidoLocalUseCase`) orchestrate business operations. Port interfaces (`IDianSoapPort`, `IInvoiceLogRepositoryPort`) declare the contracts that infrastructure must implement — the application layer never imports a concrete adapter directly.
+  </Card>
+  <Card title="Infrastructure" icon="server">
+    Driving adapters (FastAPI controllers) translate HTTP requests into use case calls. Driven adapters (`DianSoapAdapter`) translate use case calls into outbound SOAP requests and PostgreSQL writes. All wired together via FastAPI's `Depends()` dependency injection.
+  </Card>
+</CardGroup>
+
+For a deep dive into how the port interfaces and adapters are implemented, see the [Hexagonal Design](/architecture/hexagonal) page. To trace the complete lifecycle of a single invoice request — from HTTP body parsing through SOAP call to audit log — see the [Data Flow](/architecture/data-flow) page.

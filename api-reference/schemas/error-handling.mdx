@@ -1,0 +1,242 @@
+---
+title: "Error Handling and HTTP Status Codes in DIAN REST API"
+sidebarTitle: "Error Handling"
+description: "All HTTP error codes, error response shapes, and DIAN SOAP error types returned by DIAN REST API — with causes and remediation steps."
+---
+
+DIAN REST API uses standard HTTP status codes for REST-level errors and a structured JSON body for application-level errors. Understanding the error hierarchy — Pydantic validation failures, business rule violations enforced by the use case, and DIAN SOAP-layer errors returned by the adapter — helps you build robust integrations that fail fast, log correctly, and recover gracefully from the range of issues that can occur when interacting with Colombia's DIAN electronic invoicing service.
+
+---
+
+## HTTP Status Code Reference
+
+| Code | Meaning | When it occurs |
+|------|---------|----------------|
+| `201 Created` | Invoice submitted successfully | DIAN accepted the document; `track_id` and `status` are populated in the response body |
+| `422 Unprocessable Entity` | Request validation failed | A required field is missing, a value has the wrong type, or a Pydantic validator constraint (e.g., `gt=0` on `cantidad`) is violated |
+| `500 Internal Server Error` | DIAN submission failed | SOAP timeout, DIAN service rejection, WSDL mismatch, certificate error, or any unhandled exception in the adapter layer |
+
+---
+
+## 422 Validation Error
+
+FastAPI automatically returns `422 Unprocessable Entity` whenever the incoming JSON request body fails Pydantic schema validation. The response body contains a `detail` array where each element identifies the exact location and nature of the failure.
+
+**Standard 422 response shape (FastAPI/Pydantic v2):**
+
+```json
+{
+  "detail": [
+    {
+      "type": "<error_type>",
+      "loc": ["body", "<field_path>"],
+      "msg": "<human_readable_message>",
+      "input": { "<submitted_value_or_body>" }
+    }
+  ]
+}
+```
+
+### Missing Required Field
+
+If `items` is omitted from the request body:
+
+```json
+{
+  "detail": [
+    {
+      "type": "missing",
+      "loc": ["body", "items"],
+      "msg": "Field required",
+      "input": {"id_pedido_origen": "POS-100"}
+    }
+  ]
+}
+```
+
+### Business Rule Violation — Mismatched Totals
+
+`PedidoLocalCreateRequest` passes Pydantic validation even if the totals are arithmetically inconsistent, because Pydantic only validates types and field constraints. The total integrity check is enforced in `FacturarPedidoLocalUseCase.execute()`:
+
+```python
+expected_total = payload.subtotal + payload.impuestos_totales + payload.propina_voluntaria
+if payload.total_factura != expected_total:
+    raise ValueError(
+        "El total de la factura no coincide con la suma del subtotal, impuestos y propina."
+    )
+```
+
+When this `ValueError` is raised, FastAPI propagates it as an unhandled exception, resulting in a `500 Internal Server Error`. To avoid this, **always verify on the POS side that:**
+
+```
+total_factura == subtotal + impuestos_totales + propina_voluntaria
+```
+
+before submitting the request.
+
+---
+
+## 500 DIAN Submission Error
+
+When the DIAN SOAP adapter fails — regardless of the underlying cause — the controller returns a `500 Internal Server Error` with the following structured body (from `src/infrastructure/controllers/pedido_local_controller.py`):
+
+```python
+if not result.get("success"):
+    return JSONResponse(
+        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        content={"message": "Error enviando a la DIAN", "details": result}
+    )
+```
+
+The response envelope always has this shape:
+
+```json
+{
+  "message": "Error enviando a la DIAN",
+  "details": {
+    "success": false,
+    "error": "<error_type>",
+    "message": "<error_description>"
+  }
+}
+```
+
+### Adapter-Level Error Cases
+
+The DIAN SOAP adapter surfaces two distinct error categories:
+
+**1. Timeout**
+
+DIAN did not respond within the configured timeout window (30 seconds via `httpx`).
+
+```json
+{
+  "success": false,
+  "error": "Timeout",
+  "message": "La DIAN tardó demasiado en responder."
+}
+```
+
+*Cause:* DIAN's habilitación or production SOAP service is temporarily slow or unreachable.
+
+*Remediation:* Retry after a delay. DIAN's habilitación service has documented availability windows; production service downtime is rare but possible during maintenance. Implement exponential backoff — start with a 5-second delay and double on each retry up to a maximum of 3 attempts.
+
+---
+
+**2. Generic Exception**
+
+Any other exception caught during the SOAP call: XML/WSDL parsing errors, TLS handshake failures, SOAP fault responses, network errors, or certificate issues.
+
+```json
+{
+  "success": false,
+  "error": "<ExceptionClassName>",
+  "message": "<str(e)>"
+}
+```
+
+The `error` field contains the Python exception class name (e.g., `"zeep.exceptions.Fault"`, `"ssl.SSLError"`) and `message` contains the exception string.
+
+*Cause:* WSDL mismatch, malformed XML, invalid or expired certificate, network routing failure.
+
+*Remediation:* Check the WSDL URL configured in `DIAN_WSDL_URL_HABILITACION` or `DIAN_WSDL_URL_PRODUCCION`, verify DIAN's service status page, and confirm the PFX certificate at `DIAN_CERT_PATH` is valid and not expired.
+
+---
+
+## Common Error Scenarios
+
+<Accordion title="total_factura does not match subtotal + impuestos_totales + propina_voluntaria">
+  **Error message:**
+  ```
+  ValueError: El total de la factura no coincide con la suma del subtotal, impuestos y propina.
+  ```
+
+  **Cause:** The submitted `total_factura` field does not arithmetically equal `subtotal + impuestos_totales + propina_voluntaria`. This is enforced in `FacturarPedidoLocalUseCase.execute()` before any DIAN call is attempted.
+
+  **Remediation:** Recalculate all totals in your POS system immediately before building the request payload. This is a pre-submission check — do not rely on the API to auto-correct totals. For example:
+
+  ```python
+  total_factura = subtotal + impuestos_totales + propina_voluntaria
+  # Only then build and send the PedidoLocalCreateRequest
+  ```
+</Accordion>
+
+<Accordion title="Failed to load the PFX certificate">
+  **When it occurs:** At application startup, when `DianSoapAdapter` is instantiated and attempts to load the PKCS#12 certificate from disk.
+
+  **Cause:** The file at `DIAN_CERT_PATH` does not exist, is not readable by the application process, or `DIAN_CERT_PASSWORD` is incorrect.
+
+  **Remediation:**
+  - Verify the file path in your `.env`: `DIAN_CERT_PATH=/absolute/path/to/cert.pfx`
+  - Confirm the file is readable: `ls -la $DIAN_CERT_PATH`
+  - Confirm the password is correct by testing the certificate independently with OpenSSL:
+    ```bash
+    openssl pkcs12 -in cert.pfx -noout -passin pass:your_password
+    ```
+  - Ensure the certificate has not expired.
+</Accordion>
+
+<Accordion title="SOAP Timeout — DIAN does not respond within 30 seconds">
+  **When it occurs:** During the `SendTestSetAsync` (habilitación) or production SOAP call, if DIAN's service does not return a response within the adapter's configured `httpx` timeout of 30 seconds.
+
+  **Response body:**
+  ```json
+  {
+    "message": "Error enviando a la DIAN",
+    "details": {
+      "success": false,
+      "error": "Timeout",
+      "message": "La DIAN tardó demasiado en responder."
+    }
+  }
+  ```
+
+  **Cause:** DIAN's habilitación service has scheduled maintenance windows and can be intermittently slow. Network latency from outside Colombia may also contribute.
+
+  **Remediation:** Implement retry logic with exponential backoff in your POS integration layer. A simple strategy:
+
+  ```python
+  import asyncio
+
+  MAX_RETRIES = 3
+  for attempt in range(MAX_RETRIES):
+      response = await submit_invoice(payload)
+      if response.status_code != 500:
+          break
+      await asyncio.sleep(5 * (2 ** attempt))  # 5s, 10s, 20s
+  ```
+
+  Do not retry indefinitely — log the failure and alert operations if all retries are exhausted.
+</Accordion>
+
+<Accordion title="422 on cantidad — zero or negative quantity">
+  **Error message:**
+  ```json
+  {
+    "detail": [
+      {
+        "type": "greater_than",
+        "loc": ["body", "items", 0, "cantidad"],
+        "msg": "Input should be greater than 0",
+        "input": 0
+      }
+    ]
+  }
+  ```
+
+  **Cause:** The `cantidad` field on `ItemPedidoRequest` has a `gt=0` Pydantic constraint:
+
+  ```python
+  cantidad: int = Field(..., gt=0, json_schema_extra={"example": 2})
+  ```
+
+  Sending `0` or any negative integer for item quantity will trigger this validation error before the request reaches the use case.
+
+  **Remediation:** Filter out zero-quantity items in your POS system before building the request payload. Only include items with `cantidad >= 1`.
+</Accordion>
+
+---
+
+<Tip>
+  Use the Swagger UI at `http://localhost:8000/docs` to test requests interactively and see the exact Pydantic validation error messages before writing your integration code. The `/docs` interface renders the full OpenAPI schema — including field constraints, examples, and descriptions — and lets you submit live requests against your running instance to observe real error shapes.
+</Tip>
