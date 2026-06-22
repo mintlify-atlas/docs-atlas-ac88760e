@@ -1,7 +1,7 @@
 ---
 title: "GET /health — DIAN REST API Health Check Endpoint"
 sidebarTitle: "GET /health"
-description: "GET /health returns the current status of the DIAN REST API service. Use it for liveness probes and uptime monitoring."
+description: "GET /health returns the current status of the DIAN REST API service. Use it for liveness probes, uptime monitoring, and container readiness checks."
 ---
 
 The `/health` endpoint confirms the API is running and accepting requests. It is a lightweight, unauthenticated probe designed for load balancer health checks, Kubernetes liveness probes, and uptime monitoring dashboards. No credentials are required and no database queries are performed — the response is returned directly by the FastAPI application layer.

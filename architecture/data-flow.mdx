@@ -58,9 +58,13 @@ This page traces a single electronic invoice request from the exact moment it en
         ...
         return FacturarPedidoLocalUseCase(
             dian_port=dian_adapter,
-            log_repo=MockLogRepo()
+            log_repo=MockLogRepo()  # ⚠ Bug: should be log_repository=MockLogRepo()
         )
     ```
+
+    <Warning>
+    The current source passes `log_repo=MockLogRepo()` to the use case constructor, but `FacturarPedidoLocalUseCase.__init__` declares the parameter as `log_repository`. This keyword argument name mismatch will raise a `TypeError` at runtime. It must be corrected to `log_repository=MockLogRepo()` before the dependency injection chain is exercised in production.
+    </Warning>
   </Step>
 
   <Step title="Business Validation">

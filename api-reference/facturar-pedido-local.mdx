@@ -1,5 +1,5 @@
 ---
-title: "POST /api/v1/pedidos/consumo-local/ — Invoice a Dine-In Restaurant Order"
+title: "POST /consumo-local — Invoice a Dine-In Order to DIAN"
 sidebarTitle: "POST /consumo-local"
 description: "POST /api/v1/pedidos/consumo-local/ accepts a POS order payload and submits an electronic invoice to DIAN. Returns track_id and CUFE on success."
 ---
@@ -83,7 +83,7 @@ The endpoint accepts a JSON body that conforms to `PedidoLocalCreateRequest` (de
     </ParamField>
 
     <ParamField body="total_item" type="Decimal" required>
-      Total value of this line including taxes (e.g., `21600.00`).
+      Total value of this line including taxes (e.g., `21600.0`).
     </ParamField>
   </Expandable>
 </ParamField>

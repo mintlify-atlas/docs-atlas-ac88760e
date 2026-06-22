@@ -16,12 +16,6 @@ The **Dirección de Impuestos y Aduanas Nacionales (DIAN)** is Colombia's nation
   <Card title="Factura Electrónica" icon="file-invoice">
     Emit electronic invoices for local consumption orders from POS systems. The API validates line-item totals, applies tax rules, and submits the signed document to DIAN's SOAP service, returning a `track_id` for status tracking.
   </Card>
-  <Card title="Nota Crédito" icon="rotate-left">
-    Generate credit notes that reference a previously submitted electronic invoice. Used for partial or full reversals that must be reported to DIAN for audit compliance.
-  </Card>
-  <Card title="Delivery Order Invoicing" icon="truck">
-    Issue electronic invoices for delivery orders, supporting the same tax and payment structures as local consumption orders while maintaining a separate document trail.
-  </Card>
   <Card title="PostgreSQL Audit Logging" icon="database">
     Every invoicing attempt — successful or failed — is written to a PostgreSQL audit log via an async SQLAlchemy adapter. The log captures the full inbound payload, the DIAN response, and the final document status.
   </Card>
@@ -36,6 +30,8 @@ DIAN REST API is built on a carefully chosen set of modern Python libraries, all
 - **SQLAlchemy (Async) + Alembic** — async ORM for PostgreSQL persistence and schema migration management.
 - **zeep + httpx** — `zeep` provides the SOAP client, configured with `httpx`'s `AsyncTransport` so SOAP calls never block FastAPI's event loop.
 - **cryptography** — loads and validates the DIAN PFX certificate at startup and signs XML payloads.
+- **lxml** — XML processing library used for constructing and parsing the signed XML documents submitted to DIAN.
+- **asyncpg** — high-performance async PostgreSQL driver used by SQLAlchemy's async engine.
 - **PostgreSQL** — relational database for secure, auditable transaction logging.
 - **uv** — fast, robust package manager and virtual environment tool that replaces `pip` and `virtualenv`.
 

@@ -240,7 +240,7 @@ def get_use_case(
 ```
 
 <Note>
-`MockLogRepo` inside `get_use_case()` is a temporary no-op placeholder. It satisfies the constructor signature while the real PostgreSQL adapter (SQLAlchemy async) is pending implementation. Once the database adapter is complete, `MockLogRepo` will be replaced with the real `IInvoiceLogRepositoryPort` implementation and wired in the same `Depends()` chain.
+`MockLogRepo` inside `get_use_case()` is a temporary no-op placeholder for the log port while the real PostgreSQL adapter (SQLAlchemy async) is pending implementation. The constructor call passes `log_repo=MockLogRepo()`, but `FacturarPedidoLocalUseCase.__init__` declares the parameter as `log_repository` — this keyword argument name mismatch will raise a `TypeError` at runtime and must be corrected to `log_repository=MockLogRepo()` before the dependency injection chain is exercised. Once the database adapter is complete, `MockLogRepo` will be replaced with the real `IInvoiceLogRepositoryPort` implementation.
 </Note>
 
 The route handler receives the fully constructed use case through `Depends(get_use_case)`:

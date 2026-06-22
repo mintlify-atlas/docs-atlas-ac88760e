@@ -104,7 +104,7 @@ The full SQLAlchemy model and Alembic migration script are the next implementati
 
 ## Current Development State
 
-While the PostgreSQL adapter is pending, the controller injects a `MockLogRepo` placeholder that satisfies the interface structurally but silently discards all log data. You can see this in `src/infrastructure/controllers/pedido_local_controller.py`:
+While the PostgreSQL adapter is pending, the controller injects a `MockLogRepo` placeholder. You can see this in `src/infrastructure/controllers/pedido_local_controller.py`:
 
 ```python
 def get_use_case(
@@ -124,7 +124,13 @@ def get_use_case(
     )
 ```
 
-`MockLogRepo` accepts all calls without raising errors, which keeps the application functional during development. No data is persisted. **Do not deploy this to a production environment** — every invoice submission will be untracked and unrecoverable from the application's own records.
+<Warning>
+  **Known discrepancy — `MockLogRepo` does not implement `IInvoiceLogRepositoryPort`.**
+
+  `MockLogRepo` exposes `log_attempt` and `update_status`, but `IInvoiceLogRepositoryPort` requires `save_log`. Because Python's structural `Protocol` check is not enforced at construction time, the application starts without error. However, `FacturarPedidoLocalUseCase.execute()` calls `self.log_repository.save_log(...)` at runtime, which will immediately raise an `AttributeError` on any real invoice request. **Do not make live requests against this controller** until `MockLogRepo` is replaced with a real adapter or corrected to implement `save_log`.
+</Warning>
+
+No data is persisted by `MockLogRepo`. **Do not deploy this to a production environment** — every invoice submission will be untracked and unrecoverable from the application's own records.
 
 ## Implementing Your Own Log Adapter
 

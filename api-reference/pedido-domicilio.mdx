@@ -1,7 +1,7 @@
 ---
 title: "POST /api/v1/pedidos/domicilio/ — Invoice a Delivery Order"
 sidebarTitle: "POST /domicilio"
-description: "Submit a delivery order invoice to DIAN, including a separately taxed delivery fee. Supports orders from Rappi, Didi, and proprietary platforms. Currently planned."
+description: "Submit a delivery order invoice to DIAN with a separately taxed delivery fee. Supports Rappi, Didi, and proprietary delivery platforms. Currently planned."
 ---
 
 Delivery orders (*pedidos a domicilio*) require a dedicated invoicing flow because the delivery fee is taxed differently from the prepared food items on the same order. While restaurant food typically carries INC at 8 %, the delivery fee is generally subject to IVA at 19 % — and must appear as a distinct, separately taxed line on the electronic invoice. This endpoint handles orders from any delivery channel: Rappi, Didi, your own web platform, or an in-house dispatcher. The acquirer model mirrors the local order endpoint and supports both anonymous consumers and identified customers.

@@ -15,6 +15,8 @@ DIAN REST API is built on **Hexagonal Architecture (Ports & Adapters)**, a desig
 | **SQLAlchemy Async + Alembic** | Async ORM for PostgreSQL access; Alembic manages schema migrations |
 | **zeep + httpx AsyncTransport** | Async SOAP client for communicating with DIAN web services without blocking the event loop |
 | **PostgreSQL** | Relational storage for the full audit log of every invoice attempt and its DIAN response |
+| **asyncpg** | High-performance async PostgreSQL driver used by SQLAlchemy's async engine for non-blocking database I/O |
+| **lxml** | XML processing library required by zeep for SOAP envelope serialisation and parsing |
 | **cryptography** | Loads PFX certificates at startup via `pkcs12.load_key_and_certificates` — fails fast if the cert or password is invalid |
 | **uv** | Fast dependency management and virtual environment tooling (replaces pip/virtualenv) |
 | **ruff** | Linting and code formatting enforced across the entire codebase |

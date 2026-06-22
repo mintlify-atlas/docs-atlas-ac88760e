@@ -1,7 +1,7 @@
 ---
-title: "Configure the DIAN PFX Digital Certificate for Invoice Signing"
+title: "DIAN PFX Certificate Configuration for Invoice Signing"
 sidebarTitle: "PFX Certificate"
-description: "How to obtain, place, and configure your DIAN-issued PFX digital signing certificate so DIAN REST API validates it on startup and uses it for SOAP requests."
+description: "How to obtain, place, and configure your DIAN-issued PFX certificate so DIAN REST API validates it on startup and uses it for SOAP requests."
 ---
 
 Every electronic invoice submitted to Colombia's DIAN must be digitally signed using a PFX (PKCS#12) certificate issued through the DIAN habilitación process. DIAN REST API reads this certificate at application startup via the `Settings` class and **refuses to start** if the file cannot be found, decrypted, or parsed. This fast-fail design prevents silent signing failures from reaching production traffic.
@@ -127,7 +127,7 @@ class Settings(BaseSettings):
         try:
             with open(pfx_path, "rb") as cert_file:
                 pfx_data = cert_file.read()
-            # Try to load the key and certs; if the password or format is wrong, this raises
+            # Try to load the key and certs, if the password or format is wrong, this will raise exceptions
             pkcs12.load_key_and_certificates(
                 pfx_data,
                 password.encode("utf-8") if password else None,

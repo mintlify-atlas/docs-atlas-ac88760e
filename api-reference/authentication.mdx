@@ -1,7 +1,7 @@
 ---
 title: "Authentication and DIAN Credentials in DIAN REST API"
 sidebarTitle: "Authentication"
-description: "How DIAN REST API authenticates with Colombia's DIAN SOAP service using a PFX certificate, TestSetId, SoftwareId, and SoftwarePin — with no client-facing auth layer."
+description: "How the DIAN REST API authenticates with Colombia's DIAN SOAP service using a PFX certificate, TestSetId, SoftwareId, and SoftwarePin."
 ---
 
 DIAN REST API operates with a **two-layer authentication model**: there is currently no authentication enforced on the HTTP REST endpoints themselves, but every outbound DIAN SOAP call is authenticated using a PFX digital certificate and a set of DIAN-issued credentials. All credentials are loaded from environment variables at startup via Pydantic Settings, and the PFX certificate is validated before the application accepts any traffic. Understanding this split is essential for both integrating with the API and deploying it safely.

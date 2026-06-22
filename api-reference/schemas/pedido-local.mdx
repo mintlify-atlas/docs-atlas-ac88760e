@@ -62,7 +62,7 @@ class PedidoLocalCreateRequest(BaseModel):
 <ParamField body="id_pedido_origen" type="string" required>
   The unique order ID from the originating POS system. This is stored as `id_pedido` on the `PedidoLocal` domain entity and is used to correlate the DIAN submission back to the source transaction.
 
-  **Example:** `"PROD-001"`
+  **Example:** `"POS-100"`
 </ParamField>
 
 <ParamField body="adquirente" type="AdquirenteRequest" optional>

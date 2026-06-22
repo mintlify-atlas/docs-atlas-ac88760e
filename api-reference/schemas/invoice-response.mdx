@@ -1,7 +1,7 @@
 ---
 title: "PedidoLocalResponse: Invoice Submission Response Schema"
 sidebarTitle: "Response Schema"
-description: "Reference for PedidoLocalResponse — the response schema returned by DIAN REST API after submitting an electronic invoice, including track_id, CUFE, and status."
+description: "Reference for PedidoLocalResponse — the Pydantic model returned after a successful DIAN invoice submission, including track_id, CUFE, and status fields."
 ---
 
 `PedidoLocalResponse` is the Pydantic model returned by `POST /api/v1/pedidos/consumo-local/` on a successful DIAN submission. It wraps DIAN's native response identifiers — the `ZipKey` tracking ID and the CUFE cryptographic hash — in a clean, typed structure that abstracts away the raw SOAP response format and provides a consistent JSON envelope for your POS integration to consume.
